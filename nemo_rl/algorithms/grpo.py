@@ -1661,7 +1661,8 @@ def grpo_train(
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if weight_sync is not None and weight_sync.is_stale:
-            weight_sync.sync_weights()
+            # ISOLATION(pack_cp): inline main refit instead of synchronizer wrapper
+            refit_policy_generation(policy, policy_generation, colocated_inference)
         else:
             policy_generation.prepare_for_generation()
         val_metrics, validation_timings = validate(
@@ -1770,7 +1771,11 @@ def grpo_train(
                                 calibration_data, include_q=True
                             )["layers"]
 
-                        weight_sync.sync_weights(
+                        # ISOLATION(pack_cp): inline main refit instead of synchronizer wrapper
+                        refit_policy_generation(
+                            policy,
+                            policy_generation,
+                            colocated_inference,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
@@ -2180,7 +2185,11 @@ def grpo_train(
                 ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if weight_sync is not None and weight_sync.is_stale:
-                        weight_sync.sync_weights(
+                        # ISOLATION(pack_cp): inline main refit instead of synchronizer wrapper
+                        refit_policy_generation(
+                            policy,
+                            policy_generation,
+                            colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                     else:
