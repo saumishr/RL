@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import Counter
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -68,6 +69,10 @@ from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
+
+# Throttle for the train-pump stall report. The select-retry loop spins every
+# 5ms, so the buffer snapshot has to be rate-limited to stay readable.
+_STALL_LOG_SECONDS = 30.0
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -168,6 +173,7 @@ class SingleControllerActor:
         self._trainer_version: int = 0
         self._train_steps: int = 0
         self._current_epoch: int = 0
+        self._last_stall_log: float = 0.0
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "masked_advantages": [],
@@ -364,6 +370,12 @@ class SingleControllerActor:
         while self._train_steps < grpo_cfg["max_num_steps"]:
             version_during_step = self._trainer_version
             groups_dispatched = 0
+            # Number of times the pump dispatched a partial batch to the trainer.
+            # 1 means the first select returned the whole step, i.e. the trainer
+            # waited on a full batch and streaming did not engage, which is what
+            # min_groups_for_streaming_train == num_prompts_per_step forces.
+            dispatches = 0
+            dispatch_sizes: list[int] = []
             min_sample_version = None
             step_open = False
             calibration_batches: list[BatchedDataDict[Any]] = []
@@ -418,6 +430,25 @@ class SingleControllerActor:
                                     f"{grpo_cfg['num_prompts_per_step']} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
+                                )
+                            now = time.monotonic()
+                            if now - self._last_stall_log >= _STALL_LOG_SECONDS:
+                                self._last_stall_log = now
+                                ready = self._buffer.ready_list
+                                print(
+                                    "train_pump waiting: "
+                                    f"trainer_version={self._trainer_version} "
+                                    f"dispatched={groups_dispatched}/"
+                                    f"{grpo_cfg['num_prompts_per_step']} "
+                                    f"asked_min={min_prompt_groups} "
+                                    f"buffer={len(self._buffer)} "
+                                    f"ready={sum(ready)} "
+                                    f"inflight={self._inflight_rollouts} "
+                                    "ready_by_target_step="
+                                    f"{dict(Counter(t for t, r in zip(self._buffer.target_step_list, ready) if r))} "
+                                    "ready_by_start_weight="
+                                    f"{dict(Counter(w for w, r in zip(self._buffer.start_weight_list, ready) if r))}",
+                                    flush=True,
                                 )
                             await asyncio.sleep(0.005)
                             continue
@@ -504,6 +535,8 @@ class SingleControllerActor:
                     )
 
                     groups_dispatched += num_groups
+                    dispatches += 1
+                    dispatch_sizes.append(num_groups)
 
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
@@ -569,7 +602,9 @@ class SingleControllerActor:
             print(
                 f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
                 f"trainer_v={self._trainer_version}  "
-                f"lag={lag}  ",
+                f"lag={lag}  "
+                f"dispatches={dispatches}  "
+                f"dispatch_sizes={dispatch_sizes}  ",
                 flush=True,
             )
 

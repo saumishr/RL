@@ -1,0 +1,93 @@
+# =============================================================================
+# Nemotron 3 Ultra (550B) SWE — SingleController + TransferQueue, streaming ON
+# =============================================================================
+# Test arm of the SWE throughput comparison. Same stage, model, data, container,
+# node split and step sizing as tiny_swe_teacher.yaml (the control); the only
+# differences are the entrypoint (examples/run_grpo_single_controller.py), the
+# TransferQueue data plane, and the async_rl streaming knobs below.
+#
+# SWE is the workload where this matters most: rollout durations are agent-loop
+# bound and wildly dispersed. A measured pair of statistically identical 32-
+# rollout batches on this shape finished at 18:05 and 40:25 — so a trainer that
+# waits for a whole batch waits on the slower one, every step.
+#
+# GBS invariant: num_prompts_per_step(8) * num_generations_per_prompt(16) = 128.
+# EP=32 (inherited) shards experts, so per-rank memory stays well inside budget.
+# =============================================================================
+
+defaults:
+  - tiny_swe_teacher.yaml            # 48-node Ultra SWE (TP8·CP16·EP32, 65k, GBS 128)
+
+# SingleController's own async config (SC reads this, not grpo.async_grpo).
+#
+# Lag-4 / least-starvation tuning for num_prompts_per_step=8 (maps the older
+# async_rl.max_weight_staleness_versions / min_prompt_groups_per_batch /
+# over_sampling / force_in_order knobs onto the current sampler schema):
+#   max_inflight = max_buffered = num_prompts_per_step * (staleness + 1) = 40
+#   min_groups_for_streaming_train = 1
+#   windowed sampler = over_sampling=true, force_in_order=false
+async_rl:
+  sampler:
+    name: windowed
+    max_staleness_versions: 4
+    sample_freshest_first: false
+  recompute_kv_cache_after_weight_updates: false
+
+  # Train as soon as any ready group is available; remaining groups of the step
+  # keep arriving while training runs. Setting this equal to num_prompts_per_step
+  # reinstates the full-batch barrier streaming exists to remove.
+  min_groups_for_streaming_train: 1
+
+  # Concurrent prompt rollouts: one live step plus `max_staleness_versions`
+  # steps of lookahead so generation never idles waiting on the trainer.
+  max_inflight_prompts: 40
+
+  # Match max_inflight so buffer backpressure is not the binding constraint
+  # before the staleness window is. Windowed declares no required capacity.
+  max_buffered_rollouts: 40
+  diagnostics: false
+
+grpo:
+  val_period: 0                      # SC: no validation yet
+  # Run with NO reference model, matching the control arm's inherited kl=0.
+  # grpo.py auto-enables this when the ref model isn't loaded, but the SC setup
+  # path has no such guard, so the train pump would still mark reference
+  # logprobs "required" and crash fetching them from an unloaded model.
+  skip_reference_policy_logprobs_calculation: true
+
+checkpointing:
+  enabled: false                     # SC: no checkpointing yet
+
+policy:
+  # No optimizer_cpu_offload override: with kl=0 and the skip flag above there is
+  # no reference model resident, so the SC GPU profile matches the legacy arm and
+  # the inherited offload=false holds. Raising kl here would load a ref model
+  # (+43 GB GPU → weight-sync OOM), and offloading to compensate moves the 550B
+  # optimizer to host RAM and trips host oom_kill. Both costs belong to the ref
+  # model; the TransferQueue data plane is host-side and is not the cause.
+  draft:                             # run_grpo_single_controller.py reads policy.draft.enabled
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+loss_fn:
+  # Matches the control arm's inherited value, so neither arm pays a
+  # reference-logprob forward pass the other avoids.
+  reference_policy_kl_penalty: 0.0
+
+# TransferQueue data plane (mandatory for run_grpo_single_controller.py).
+# backend "simple" keeps sample bytes in SimpleStorageUnit Ray actors, so this
+# arm is not exercising RDMA — the delta against the control is the streaming
+# control plane, not the transport. Switching to mooncake_cpu is a separate
+# change and should be measured separately.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888   # 512 GiB (only used by mooncake_cpu backend)
+  local_buffer_size:   68719476736    # 64 GiB  (only used by mooncake_cpu backend)

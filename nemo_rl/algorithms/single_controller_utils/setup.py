@@ -45,7 +45,11 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    RayVirtualCluster,
+    get_ray_cluster_topology,
+    prepare_segment_topology,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager
@@ -90,18 +94,27 @@ class SingleControllerActorArgs:
 def _build_clusters(
     master_config: MasterConfig,
 ) -> tuple[RayVirtualCluster, RayVirtualCluster]:
-    """Allocate train + inference clusters; one shared cluster when colocated."""
+    """Allocate train + inference clusters; one shared cluster when colocated.
+
+    Honors ``cluster.segment_size`` the same way GRPO does: pin placement groups
+    to complete NVLink-domain segments so HybridEP / MoE EP groups (and vLLM
+    TP groups) stay on fabric instead of crossing racks over IB.
+    """
     cluster_config = master_config.cluster
     generation_config = master_config.policy["generation"]
     colocated = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
     num_nodes = cluster_config["num_nodes"]
     gpus_per_node = cluster_config["gpus_per_node"]
+    segment_size = cluster_config.get("segment_size")
     port_range_low = cluster_config.get("master_port_range_low")
     port_range_high = cluster_config.get("master_port_range_high")
 
     if colocated:
         # Policy + generation share GPUs — one cluster.
+        node_resource_constraints, _, _ = prepare_segment_topology(
+            segment_size, num_nodes
+        )
         cluster = RayVirtualCluster(
             name="sc_policy_cluster",
             bundle_ct_per_node_list=[gpus_per_node] * num_nodes,
@@ -110,6 +123,8 @@ def _build_clusters(
             max_colocated_worker_groups=1 if backend == "megatron" else 2,
             port_range_low=port_range_low,
             port_range_high=port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
         return cluster, cluster
 
@@ -139,6 +154,79 @@ def _build_clusters(
             f"train_nodes must be > 0: {num_nodes} - {inference_nodes} = {train_nodes}"
         )
 
+    # Topology-aware domain constraints (mirrors grpo.setup_grpo_clusters).
+    # EP groups must land inside one NVLink domain or HybridEP fabric-handle
+    # import aborts; vLLM TP>node likewise wants intra-domain ranks.
+    node_resource_constraints = None
+    inference_node_resource_constraints = None
+    inference_segment_size = None
+    if segment_size is not None:
+        topology = get_ray_cluster_topology()
+        num_alive_nodes = len(topology)
+        required_nodes = train_nodes + inference_nodes
+        assert num_alive_nodes >= required_nodes, (
+            f"Not enough alive Ray nodes for all roles: "
+            f"need {required_nodes} (train={train_nodes} + inference={inference_nodes}), "
+            f"but only {num_alive_nodes} alive nodes found"
+        )
+        node_resource_constraints, remaining_node_ids, topology = (
+            prepare_segment_topology(
+                segment_size, train_nodes, topology=topology, role="training"
+            )
+        )
+        if node_resource_constraints is not None and backend == "vllm":
+            vllm_cfg = generation_config.get("vllm_cfg", {})
+            gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+                "pipeline_parallel_size", 1
+            )
+            nodes_per_instance = (
+                gpus_per_instance + inference_gpus_per_node - 1
+            ) // inference_gpus_per_node
+            if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+                remaining_topology = {
+                    nid: topology[nid] for nid in remaining_node_ids
+                }
+                (
+                    inference_node_resource_constraints,
+                    _,
+                    _,
+                ) = prepare_segment_topology(
+                    nodes_per_instance,
+                    inference_nodes,
+                    topology=remaining_topology,
+                    role="inference",
+                )
+                inference_segment_size = nodes_per_instance
+            elif nodes_per_instance > 1:
+                print(
+                    f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+                    f"nodes_per_instance={nodes_per_instance} "
+                    f"(gpus_per_instance={gpus_per_instance}); "
+                    f"skipping inference topology constraints",
+                    flush=True,
+                )
+        elif node_resource_constraints is not None and backend == "sglang":
+            sglang_cfg = generation_config.get("sglang_cfg", {})
+            gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
+            nodes_per_instance = (
+                gpus_per_instance + inference_gpus_per_node - 1
+            ) // inference_gpus_per_node
+            if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+                remaining_topology = {
+                    nid: topology[nid] for nid in remaining_node_ids
+                }
+                (
+                    inference_node_resource_constraints,
+                    _,
+                    _,
+                ) = prepare_segment_topology(
+                    nodes_per_instance,
+                    inference_nodes,
+                    topology=remaining_topology,
+                    role="inference",
+                )
+                inference_segment_size = nodes_per_instance
+
     train_cluster = RayVirtualCluster(
         name="sc_train_cluster",
         bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
@@ -147,7 +235,18 @@ def _build_clusters(
         max_colocated_worker_groups=1,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=segment_size,
+        node_resource_constraints=node_resource_constraints,
     )
+    # Claim constrained train nodes before inference can grab them.
+    if node_resource_constraints is not None:
+        train_cluster.get_placement_groups()
+        print(
+            f"  ✓ Ray train cluster initialized with {train_nodes} nodes "
+            f"(segment_size={segment_size}, topology-pinned)",
+            flush=True,
+        )
+
     inference_cluster = RayVirtualCluster(
         name="sc_inference_cluster",
         bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
@@ -156,7 +255,29 @@ def _build_clusters(
         max_colocated_worker_groups=1,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=inference_segment_size,
+        node_resource_constraints=inference_node_resource_constraints,
     )
+    # Must use the generation backend's PG helper (not get_placement_groups):
+    # TP*PP > gpus_per_node needs a unified PG, and get_placement_groups would
+    # create per-node PGs that VllmGeneration.__init__ then early-returns on.
+    if inference_node_resource_constraints is not None:
+        if backend == "vllm":
+            VllmGeneration.init_cluster_placement_groups(
+                inference_cluster, generation_config
+            )
+        elif backend == "sglang":
+            # SGLang always uses a unified PG (see SGLangGeneration.__init__).
+            inference_cluster._init_placement_groups(
+                strategy="PACK", use_unified_pg=True
+            )
+        else:
+            inference_cluster.get_placement_groups()
+        print(
+            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes "
+            f"(segment_size={inference_segment_size}, topology-pinned)",
+            flush=True,
+        )
     return train_cluster, inference_cluster
 
 

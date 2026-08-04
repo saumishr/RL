@@ -1,0 +1,57 @@
+# =============================================================================
+# Nemotron 3 Ultra — SWE Teacher — TINY smoke shape (48 nodes)
+# =============================================================================
+# Quick functional smoke at 65k context (matches the 65k-trained checkpoint, and
+# keeps SWE rollout tractable): GBS cut to 128 (8 prompts × 16 generations).
+# Training runs on 32 nodes at CP 16 (65536/16 = 4096 tokens per CP rank; full
+# recompute keeps the optimizer state EDP=4-sharded on GPU). EP=32 is inherited;
+# its all-to-all spans 8 nodes, within one NVL72 segment.
+#
+# Cluster (48 nodes): Training 32 / vLLM 16 / Gym 0 (code-execution rewards).
+#   NUM_TRAIN_NODES=32 NUM_GEN_NODES=16 NUM_GYM_NODES=0   (SEGMENT_SIZE=16)
+#
+# This is the control arm of the SWE streaming comparison: it runs the stage's
+# own batch-granularity async flow (grpo.async_grpo, inherited enabled with
+# max_trajectory_age_steps=1) over the in-memory ReplayBuffer and Ray's object
+# store. tiny_swe_teacher_sc_streaming.yaml is the test arm.
+# =============================================================================
+
+defaults:
+  - swe_teacher.yaml
+
+cluster:
+  num_nodes: 64         # train(32) + gen(32); overridden by ultra_launch.sh
+
+checkpointing:
+  save_period: 100                 # don't let a 550B save dominate the smoke
+  checkpoint_must_save_by: null
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 16
+
+policy:
+  train_global_batch_size: 128
+  max_total_sequence_length: 65536   # was 196608; matches the 65k-trained checkpoint & speeds rollout
+
+  megatron_cfg:
+    context_parallel_size: 16      # 65536/16 = 4096 tokens per CP rank
+
+env:
+  nemo_gym:
+    skip_venv_if_present: true
+    # swe_teacher.yaml sizes agent concurrency at 2x GBS so a streaming arm can
+    # keep a step of lookahead in flight. At this shape that is 256 agents against
+    # ~8 vLLM servers, and the streaming arm — which actually reaches the ceiling,
+    # unlike the batch control at 128 — logged 700 ClientOSError retries before
+    # dying. Drop to 1x GBS so both arms drive the serving layer equally hard.
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          concurrency: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          concurrency: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+
+sif_dir: /lustre/fsw/portfolios/llmservice/users/sdevare/images

@@ -199,6 +199,86 @@ def test_build_clusters_rejects_non_colocated_megatron_generation():
         sc_setup_mod._build_clusters(master_config)
 
 
+def test_build_clusters_pins_topology_when_segment_size_set():
+    """Non-colocated SC must honor cluster.segment_size like GRPO.
+
+    Without this, HybridEP EP groups land across NVLink domains and die on
+    fabric-handle import — the failure mode of ultra-swe-sc-streaming short.
+    """
+    master_config = _make_master_config(colocated=False, backend="vllm")
+    master_config.cluster = {
+        "num_nodes": 48,
+        "gpus_per_node": 4,
+        "segment_size": 16,
+    }
+    master_config.policy["generation"]["colocated"]["resources"] = {
+        "gpus_per_node": 4,
+        "num_nodes": 16,
+    }
+    master_config.policy["generation"]["vllm_cfg"] = {
+        "tensor_parallel_size": 8,
+        "pipeline_parallel_size": 1,
+    }
+
+    fake_topology = {f"node-{i}": (f"domain-{i // 16}", i % 16) for i in range(48)}
+    train_constraints = [{"nvlink_domain_0": 0.001}] * 32
+    remaining = [f"node-{i}" for i in range(32, 48)]
+    infer_constraints = [{"nvlink_domain_2": 0.001}] * 16
+
+    train_cluster = MagicMock(name="train")
+    inference_cluster = MagicMock(name="infer")
+
+    with (
+        patch.object(
+            sc_setup_mod,
+            "get_ray_cluster_topology",
+            return_value=fake_topology,
+        ) as mock_topo,
+        patch.object(
+            sc_setup_mod,
+            "prepare_segment_topology",
+            side_effect=[
+                (train_constraints, remaining, fake_topology),
+                (infer_constraints, [], fake_topology),
+            ],
+        ) as mock_prep,
+        patch.object(
+            sc_setup_mod,
+            "RayVirtualCluster",
+            side_effect=[train_cluster, inference_cluster],
+        ) as mock_rvc,
+        patch.object(
+            sc_setup_mod.VllmGeneration,
+            "init_cluster_placement_groups",
+        ) as mock_vllm_init,
+    ):
+        got_train, got_infer = sc_setup_mod._build_clusters(master_config)
+
+    assert got_train is train_cluster
+    assert got_infer is inference_cluster
+    mock_topo.assert_called_once()
+    assert mock_prep.call_count == 2
+    # Training claims 32 nodes in segments of 16; inference then packs TP=8
+    # (2 nodes/instance) on the remainder.
+    assert mock_prep.call_args_list[0].args[:2] == (16, 32)
+    assert mock_prep.call_args_list[0].kwargs["role"] == "training"
+    assert mock_prep.call_args_list[1].args[:2] == (2, 16)
+    assert mock_prep.call_args_list[1].kwargs["role"] == "inference"
+    train_kwargs = mock_rvc.call_args_list[0].kwargs
+    infer_kwargs = mock_rvc.call_args_list[1].kwargs
+    assert train_kwargs["segment_size"] == 16
+    assert train_kwargs["node_resource_constraints"] is train_constraints
+    assert infer_kwargs["segment_size"] == 2
+    assert infer_kwargs["node_resource_constraints"] is infer_constraints
+    train_cluster.get_placement_groups.assert_called_once()
+    # Inference must use the vLLM helper (unified PG for TP=8), not
+    # get_placement_groups which would create unusable per-node PGs.
+    inference_cluster.get_placement_groups.assert_not_called()
+    mock_vllm_init.assert_called_once_with(
+        inference_cluster, master_config.policy["generation"]
+    )
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 

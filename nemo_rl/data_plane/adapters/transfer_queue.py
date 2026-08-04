@@ -81,8 +81,9 @@ def _mooncake_transport_config() -> dict:
                 [
                     "sh",
                     "-c",
-                    "for d in /sys/class/infiniband/mlx5_*/ports/1/link_layer; do "
-                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $d)); "
+                    "for d in /sys/class/infiniband/mlx5_*; do "
+                    "  test -f $d/ports/1/link_layer && "
+                    "    grep -q Ethernet $d/ports/1/link_layer && basename $d; "
                     "done | head -1",
                 ],
                 check=False,
