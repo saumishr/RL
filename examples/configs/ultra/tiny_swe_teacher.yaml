@@ -1,5 +1,5 @@
 # =============================================================================
-# Nemotron 3 Ultra — SWE Teacher — TINY smoke shape (48 nodes)
+# Nemotron 3 Ultra — SWE Teacher — TINY smoke shape (64 nodes)
 # =============================================================================
 # Quick functional smoke at 65k context (matches the 65k-trained checkpoint, and
 # keeps SWE rollout tractable): GBS cut to 128 (8 prompts × 16 generations).
@@ -7,8 +7,8 @@
 # recompute keeps the optimizer state EDP=4-sharded on GPU). EP=32 is inherited;
 # its all-to-all spans 8 nodes, within one NVL72 segment.
 #
-# Cluster (48 nodes): Training 32 / vLLM 16 / Gym 0 (code-execution rewards).
-#   NUM_TRAIN_NODES=32 NUM_GEN_NODES=16 NUM_GYM_NODES=0   (SEGMENT_SIZE=16)
+# Cluster (64 nodes): Training 32 / vLLM 32 / Gym 0 (code-execution rewards).
+#   NUM_TRAIN_NODES=32 NUM_GEN_NODES=32 NUM_GYM_NODES=0   (SEGMENT_SIZE=16)
 #
 # This is the control arm of the SWE streaming comparison: it runs the stage's
 # own batch-granularity async flow (grpo.async_grpo, inherited enabled with
@@ -20,7 +20,9 @@ defaults:
   - swe_teacher.yaml
 
 cluster:
-  num_nodes: 64         # train(32) + gen(32); overridden by ultra_launch.sh
+  num_nodes: 64         # train(32) + gen(32); ultra_launch.sh overrides from
+                        # NUM_TRAIN_NODES + NUM_GEN_NODES, so this is a default
+                        # only for direct (non-launcher) invocations.
 
 checkpointing:
   save_period: 100                 # don't let a 550B save dominate the smoke
@@ -41,10 +43,12 @@ env:
   nemo_gym:
     skip_venv_if_present: true
     # swe_teacher.yaml sizes agent concurrency at 2x GBS so a streaming arm can
-    # keep a step of lookahead in flight. At this shape that is 256 agents against
-    # ~8 vLLM servers, and the streaming arm — which actually reaches the ceiling,
-    # unlike the batch control at 128 — logged 700 ClientOSError retries before
-    # dying. Drop to 1x GBS so both arms drive the serving layer equally hard.
+    # keep a step of lookahead in flight. That is 256 agents, and against the ~8
+    # vLLM servers of the earlier 16-generation-node shape the streaming arm —
+    # which actually reaches the ceiling, unlike the batch control at 128 —
+    # logged 700 ClientOSError retries before dying. Kept at 1x GBS so both arms
+    # drive the serving layer equally hard; the 16 servers of this shape have
+    # more headroom, but 2x has not been re-measured here.
     swe_agents_train:
       responses_api_agents:
         swe_agents:

@@ -8,15 +8,16 @@
 #
 # SWE is the workload where this matters most: rollout durations are agent-loop
 # bound and wildly dispersed. A measured pair of statistically identical 32-
-# rollout batches on this shape finished at 18:05 and 40:25 — so a trainer that
-# waits for a whole batch waits on the slower one, every step.
+# rollout batches on the earlier 16-generation-node shape finished at 18:05 and
+# 40:25 — so a trainer that waits for a whole batch waits on the slower one,
+# every step.
 #
 # GBS invariant: num_prompts_per_step(8) * num_generations_per_prompt(16) = 128.
 # EP=32 (inherited) shards experts, so per-rank memory stays well inside budget.
 # =============================================================================
 
 defaults:
-  - tiny_swe_teacher.yaml            # 48-node Ultra SWE (TP8·CP16·EP32, 65k, GBS 128)
+  - tiny_swe_teacher.yaml            # 64-node Ultra SWE (TP8·CP16·EP32, 65k, GBS 128)
 
 # SingleController's own async config (SC reads this, not grpo.async_grpo).
 #

@@ -6,15 +6,17 @@
 #     DRY_RUN=0 bash ultra_swe_streaming.sh    # submit the streaming arm
 #     DRY_RUN=0 FLOW=legacy bash ultra_swe_streaming.sh    # submit the control
 #
-# SHAPE — 48 nodes / 192 GB200 GPUs, mirroring the 48-node Ultra SWE smoke:
+# SHAPE — 64 nodes / 256 GB200 GPUs:
 #   train 32 nodes (128 GPUs)  TP8 · CP16 · EP32, 65k context
-#   gen   16 nodes ( 64 GPUs)  vLLM
+#   gen   32 nodes (128 GPUs)  vLLM TP8 -> 16 engines
 #   gym    0 nodes             SWE rewards are code execution in apptainer .sif
 #
 # SWE is the workload that makes the long tail visible. Two statistically
-# identical 32-rollout batches measured on this exact shape finished at 18:05 and
-# 40:25, so a trainer that waits for a whole batch waits on the slower one every
-# step — the observed cost was 74% of every step spent in exposed_generation.
+# identical 32-rollout batches measured on the earlier 48-node shape — same
+# training half, half the generation nodes — finished at 18:05 and 40:25, so a
+# trainer that waits for a whole batch waits on the slower one every step. The
+# observed cost there was 74% of every step spent in exposed_generation; the
+# 32 generation nodes here shorten the tail but do not remove the dispersion.
 #
 # FLOW selects the arm:
 #
@@ -73,7 +75,7 @@ ENABLE_MTP_INFERENCE=0
 # Moving to mooncake_cpu/RDMA is a separate change and a separate measurement.
 
 # --- Model and data ----------------------------------------------------------
-# The 65k-context Ultra checkpoint the 48-node SWE smoke is built around.
+# The 65k-context Ultra checkpoint this SWE smoke is built around.
 MODEL_PATH=/lustre/fsw/portfolios/llmservice/users/jiaqiz/results/ultra-v3-pipeclean/pipeclean-ultra-rl-prod_ultra_stage2sft300_fixlc_tp8_cp8_ep64_pp1_gpp16_pps512_gbs8192-20260417-jiaqi-resumestep128-65k/eval/step_152/hf
 
 # SWE agent tasks in nemo-gym format (responses_create_params / agent_ref /
@@ -108,7 +110,7 @@ SLURM_ACCOUNT=nemotron_sw_post
 SLURM_QOS=
 GPUS_PER_NODE=4
 NUM_TRAIN_NODES=32
-NUM_GEN_NODES=16
+NUM_GEN_NODES=32
 NUM_GYM_NODES=0
 SEGMENT_SIZE=16
 # Double the 1:59 window the reference runs had. At the step sizing below the
@@ -146,9 +148,10 @@ mkdir -p "${WORKSPACE_DIR}" "${HF_HOME}" "${PERSISTENT_CACHE}"
 # That shape structurally caps the result: measured on this recipe, a step costs
 # a GBS-independent 56.6s of weight sync plus 5.77s per sequence, so GBS 32
 # leaves only ~241s of compute to hide generation behind while the observed
-# rollout tail is ~800s. Even flawless streaming would stay wait-bound. At GBS
-# 128 compute per step is ~795s, roughly equal to the tail, so the tail can be
-# absorbed almost entirely — 6.3s/sequence against 32.6s measured at GBS 32.
+# rollout tail is ~800s (measured with 16 generation nodes; 32 shortens it).
+# Even flawless streaming would stay wait-bound. At GBS 128 compute per step is
+# ~795s, roughly equal to that tail, so the tail can be absorbed almost
+# entirely — 6.3s/sequence against 32.6s measured at GBS 32.
 #
 # Raising GBS is memory-neutral here: the mesh is TP8 x CP16 = 128 GPUs exactly,
 # so DP=1 and a larger GBS only adds gradient-accumulation micro-steps at the
