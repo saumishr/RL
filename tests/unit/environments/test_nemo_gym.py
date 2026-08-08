@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import time
 from copy import deepcopy
@@ -261,6 +262,23 @@ def _write_actual_test_data(original_input: list, actual_result: list):
         json.dump(data, f)
         f.write("\n")
     print(f"Wrote updated test data to {output_path}")
+
+
+def test_run_rollouts_requires_an_installed_tokenizer():
+    """run_rollouts reads the tokenizer off the actor, so reaching it without one fails.
+
+    Every call site installs it via spinup, so this is unreachable in practice -- but
+    silently postprocessing with no tokenizer is worse than a named error, and a future
+    spinup path that forgets the call should say so here rather than deeper in.
+    """
+    gym_cls = NemoGym.__ray_metadata__.modified_class
+    gym = object.__new__(gym_cls)
+    gym.rh = object()  # satisfies _require_spinup
+    gym._tokenizer = None
+
+    stream = gym.run_rollouts([{"_rowidx": 0}], "")
+    with pytest.raises(RuntimeError, match="set_tokenizer must be called"):
+        asyncio.run(stream.__anext__())
 
 
 def test_nemo_gym_postprocess_uses_batch_decode():
@@ -686,9 +704,11 @@ def test_nemo_gym_sanity(
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
         example["_rowidx"] = idx
 
+    ray.get(nemo_gym.set_tokenizer.remote(nemo_gym_tokenizer))
+
     actual_result = [None] * len(nemo_gym_sanity_test_data["input"])
     for result_ref in nemo_gym.run_rollouts.options(num_returns="streaming").remote(
-        nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
+        nemo_gym_sanity_test_data["input"], ""
     ):
         rowidx, result, _ = ray.get(result_ref)
         actual_result[rowidx] = result
