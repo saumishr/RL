@@ -716,8 +716,44 @@ echo "================================================================"
 echo ""
 
 # =============================================================================
+# Credential hygiene
+# =============================================================================
+# Everything this launcher writes for the record — provenance.txt, the DRY_RUN
+# echo, the interactive driver-command file — is scrubbed of anything shaped
+# like an inlined credential assignment. Between 2026-07-29 and 2026-08-07 the
+# launcher interpolated HF_TOKEN at compose time, and every run's provenance
+# recorded the live token in cleartext as a result.
+#
+# A deferred reference such as HF_TOKEN=\${HF_TOKEN:-} is deliberately left
+# alone: it carries no value, and recording that the launcher passed the
+# variable by name is the useful half of the provenance. Only an assignment
+# whose value is present and does not start with `$` is redacted.
+#
+# $COMMAND is never redacted. It is what actually runs, and a credential passed
+# through a positional override still has to reach the job.
+SECRET_ASSIGNMENT_RE='(^|[[:space:]])([A-Za-z_][A-Za-z0-9_.]*(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|SECRET_KEY|CREDENTIAL|CREDENTIALS))=([^[:space:]$][^[:space:]]*)'
+
+redact_credentials() {
+  sed -E "s/${SECRET_ASSIGNMENT_RE}/\1\2=<redacted>/gI"
+}
+
+# Variable names only, never values. A hit means a credential is inlined in the
+# command that ray.sub writes to a file under BASE_LOG_DIR and srun carries into
+# the container, which no amount of redacting the artifacts can undo.
+INLINED_CREDENTIALS=$(printf '%s' "${TRAIN_CMD}" | grep -oEi "${SECRET_ASSIGNMENT_RE}" \
+  | sed -E 's/^[[:space:]]+//; s/=.*$//' | sort -u | tr '\n' ' ' || true)
+if [[ -n "${INLINED_CREDENTIALS}" ]]; then
+  echo "[WARN] Credential-shaped values are inlined in the training command: ${INLINED_CREDENTIALS}" >&2
+  echo "       Redacted from provenance.txt, but still present in \$COMMAND and in ray.sub's driver command file." >&2
+  echo '       Export the variable instead and reference it as \${NAME} so the container expands it.' >&2
+fi
+
+# =============================================================================
 # Record code provenance in the run directory
 # =============================================================================
+# Created 0600 before anything is written to it. This file has carried a live
+# token before, and the historical copies that did were world-readable.
+(umask 077; : > "${RUN_DIR}/provenance.txt")
 {
   echo "timestamp: $(date -Iseconds)"
   echo "branch: $(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
@@ -730,7 +766,7 @@ echo ""
   echo "container: ${CONTAINER}"
   echo "config: ${CONFIG_PATH}"
   echo "command: ${TRAIN_CMD}"
-} > "${RUN_DIR}/provenance.txt"
+} | redact_credentials > "${RUN_DIR}/provenance.txt"
 
 # =============================================================================
 # Dry-run mode: print everything, don't submit
@@ -739,8 +775,8 @@ DRY_RUN="${DRY_RUN:-0}"
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "DRY_RUN=1 — printing TRAIN_CMD and exiting without submission."
   echo ""
-  echo "--- TRAIN_CMD ---"
-  echo "${TRAIN_CMD}"
+  echo "--- TRAIN_CMD (credential values redacted) ---"
+  echo "${TRAIN_CMD}" | redact_credentials
   echo "--- end ---"
   exit 0
 fi
@@ -785,10 +821,13 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
   LAUNCH_DIR="$(pwd)"
   ATTACH_SCRIPT="${LAUNCH_DIR}/${JOB_ID}-attach.sh"
   CMD_FILE="${LAUNCH_DIR}/${JOB_ID}-run-cmd.sh"
+  # Left unredacted, because this copy is meant to be run verbatim. Created
+  # 0600 and given the execute bit for the owner only.
+  (umask 077; : > "${CMD_FILE}")
   cat > "${CMD_FILE}" <<CMDEOF
 ${TRAIN_CMD}
 CMDEOF
-  chmod +x "${CMD_FILE}"
+  chmod 700 "${CMD_FILE}"
 
   echo ""
   echo "  Driver command saved to:  ${CMD_FILE}"
