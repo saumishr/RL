@@ -87,12 +87,20 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     Infrastructure failures re-dispatch the prompt onto a different generation shard;
     data failures are deterministic, so their budget is small and exhausting it is
     reported rather than absorbed. Nothing here ever discards a prompt silently.
+
+    Each class also has a budget for how many prompts may be given up on entirely, and
+    the two differ because the question they answer differs. Data exhaustion is a
+    property of the dataset, so ``max_skipped_prompts`` counts them for the run's
+    lifetime. Infra exhaustion is a property of the fleet at a moment in time, so
+    ``max_consecutive_dropped_prompts`` resets on every success: an outage that ends is
+    absorbed, one that does not stops the run.
     """
 
     # ── shared: consumed by generate_and_push, above the impl split ──
     # Attempts for infrastructure failures (timeout, dead shard, transport). Each retry
     # re-enters shard selection, so it lands elsewhere. Exhausting this means the fleet
-    # is broken rather than the prompt, and the run fails.
+    # is broken rather than the prompt; whether that ends the run is then decided by
+    # max_consecutive_dropped_prompts below.
     #
     # Named for the failure class it bounds, not "per prompt": this budget and the data
     # budget below are INDEPENDENT counters, not a total and a sub-total. Worst case for
@@ -112,6 +120,19 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # never actually skip anything", which meant a validator existed purely to reject
     # that one combination. At 0 the name reads as its own documentation.
     max_skipped_prompts: NonNegativeInt = 0
+    # Consecutive prompts that may exhaust their infra budget and be dropped before the
+    # run fails. Any committed rollout resets the count, so this bounds an outage rather
+    # than the run's lifetime: a fleet losing the occasional shard keeps going, a fleet
+    # that has stopped answering stops the run instead of retrying into a stall.
+    #
+    # 0 (the default) fails on the first exhaustion, which is both the behaviour before
+    # this knob existed and the default the v1 stack ships for the same idea
+    # (``async_grpo.max_generation_failures``).
+    #
+    # Counted separately from max_skipped_prompts rather than sharing one budget: a
+    # shared counter would let a bad dataset consume the allowance that exists to ride
+    # out a shard outage, which is the one distinction the failure taxonomy draws.
+    max_consecutive_dropped_prompts: NonNegativeInt = 0
     # ── path-specific ──
     native: NativeRolloutFTConfig = Field(default_factory=NativeRolloutFTConfig)
     nemo_gym: NemoGymRolloutFTConfig = Field(default_factory=NemoGymRolloutFTConfig)

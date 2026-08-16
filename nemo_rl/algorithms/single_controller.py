@@ -198,6 +198,15 @@ class SingleControllerActor:
 
         self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
 
+        # Groups that will never arrive, keyed by the training step they were stamped
+        # for. A sampler that matches batches to steps exactly (InOrderSampler) can only
+        # ever select num_prompts_per_step groups carrying that stamp, so a dropped
+        # prompt leaves that step permanently one short and the train pump waits on a
+        # group no one is generating. The pump subtracts these to close the step short.
+        # Only stamped prompts appear here: with an unstamped sampler the batch fills
+        # from whatever is ready, so a drop costs throughput but strands nothing.
+        self._batch_shortfall: dict[int, int] = {}
+
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released when the buffer
         # drops a group (sampler.evict or post-train buffer.remove).
@@ -389,6 +398,16 @@ class SingleControllerActor:
                 # Nothing was committed, so the train pump will never see this group
                 # and never release its permit on our behalf.
                 self._buffer_capacity.release()
+                if target_step is not None:
+                    self._batch_shortfall[target_step] = (
+                        self._batch_shortfall.get(target_step, 0) + 1
+                    )
+                    print(
+                        f"  target_step={target_step} is one group short "
+                        f"({self._batch_shortfall[target_step]} total); the train pump "
+                        "will close that step early",
+                        flush=True,
+                    )
                 return
 
             if self._async_cfg.diagnostics:
@@ -466,6 +485,35 @@ class SingleControllerActor:
         self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
+    def _target_groups_for_step(self, step: int) -> int:
+        """How many prompt groups this step should train on, after dropped prompts.
+
+        ``num_prompts_per_step`` is the target; groups stamped for this step that were
+        given up on are subtracted, because they are never arriving and a sampler that
+        matches batches to steps exactly cannot substitute another step's groups for
+        them. Without this the pump waits on a group no one is generating.
+
+        The step trains on fewer samples than configured, which is the point: a smaller
+        step beats a stalled run. The count is logged as ``dropped_prompt_groups`` so
+        the batch size a step actually used is recoverable afterwards.
+
+        Raises:
+            RuntimeError: Every prompt for the step was dropped. An empty step is not a
+                smaller step, and the retry and consecutive-drop budgets should have
+                failed the run long before it could happen.
+        """
+        dropped = self._batch_shortfall.get(step, 0)
+        target = self._master_config.grpo.num_prompts_per_step - dropped
+        if target < 1:
+            raise RuntimeError(
+                f"every prompt group for training step {step} was dropped "
+                f"({dropped} of {self._master_config.grpo.num_prompts_per_step}); "
+                "there is nothing to train on. Lower "
+                "async_rl.rollout_failure.max_consecutive_dropped_prompts so the run "
+                "fails while the fleet is still partially answering."
+            )
+        return target
+
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
@@ -490,7 +538,12 @@ class SingleControllerActor:
             calibration_batches: list[BatchedDataDict[Any]] = []
 
             with self._timer.time("total_step_time"):
-                while groups_dispatched < grpo_cfg.num_prompts_per_step:
+                # Re-read on every iteration rather than once: a prompt stamped for this
+                # step can be dropped while the pump is already waiting for it, which is
+                # precisely the case that would otherwise wait forever.
+                while groups_dispatched < self._target_groups_for_step(
+                    version_during_step
+                ):
                     # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
@@ -510,7 +563,8 @@ class SingleControllerActor:
 
                         # Select a batch
                         max_prompt_groups = (
-                            grpo_cfg.num_prompts_per_step - groups_dispatched
+                            self._target_groups_for_step(version_during_step)
+                            - groups_dispatched
                         )
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
@@ -638,6 +692,17 @@ class SingleControllerActor:
 
                 self._trainer_version += 1
                 self._train_steps += 1
+                dropped_prompt_groups = self._batch_shortfall.get(
+                    version_during_step, 0
+                )
+                # Prune every stamp this step or older. Popping only this step's entry
+                # would leak the ones belonging to a step that was already closed when
+                # a straggler stamped for it was finally given up on.
+                self._batch_shortfall = {
+                    step: dropped
+                    for step, dropped in self._batch_shortfall.items()
+                    if step > version_during_step
+                }
                 with self._timer.time("weight_sync"):
                     calibration_data = (
                         BatchedDataDict.from_batches(calibration_batches)
@@ -651,6 +716,10 @@ class SingleControllerActor:
                         {
                             "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
                             "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
+                            # Non-zero means this step trained on a smaller batch than
+                            # num_prompts_per_step, which any comparison of step metrics
+                            # across steps has to account for.
+                            "dropped_prompt_groups": dropped_prompt_groups,
                         }
                     )
 

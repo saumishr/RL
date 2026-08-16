@@ -256,6 +256,101 @@ def test_rollout_pump_tops_up_restored_target_step(
     assert ctrl._rollout_exhausted.is_set()
 
 
+class _SkippingRolloutManager:
+    """Every prompt is given up on within budget, so nothing is ever committed."""
+
+    async def generate_and_push(
+        self,
+        prompt: Any,
+        *,
+        target_step: int | None = None,
+        inflight_registry: dict[str, Any] | None = None,
+    ) -> RolloutOutcome:
+        del prompt, target_step, inflight_registry
+        return RolloutOutcome.SKIPPED
+
+
+@pytest.mark.parametrize(
+    ("make_sampler", "expected_shortfall"),
+    [
+        # in_order matches a batch to one step exactly, so a group that is never
+        # generated leaves that step permanently short. Without the credit the train
+        # pump waits on it forever, turning a tolerated drop into a hung run.
+        (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), {0: 1, 1: 1}),
+        # weight_fifo does not stamp a step: the batch fills from whatever is ready, so
+        # a drop costs throughput and strands nothing. Crediting here would shrink an
+        # unrelated step.
+        (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), {}),
+    ],
+)
+def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
+    make_sampler,
+    expected_shortfall: dict[int, int],
+) -> None:
+    buffer = _RecordingBuffer()
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._buffer = buffer
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
+    ctrl._rollout_manager = _SkippingRolloutManager()
+    ctrl._sampler = make_sampler(buffer)
+    prompt_batch = BatchedDataDict(
+        {"message_log": [[{"role": "user", "content": "prompt"}]]}
+    )
+    ctrl._dataloader = [prompt_batch, prompt_batch]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+    ctrl._batch_shortfall = {}
+
+    asyncio.run(ctrl._rollout_pump())
+
+    assert ctrl._batch_shortfall == expected_shortfall
+    # A dropped prompt commits nothing, so every permit comes back either way.
+    assert ctrl._buffer_capacity._value == 2
+
+
+class TestTargetGroupsForStep:
+    """How many groups a step waits for, once some are known not to be coming."""
+
+    @staticmethod
+    def _controller(num_prompts_per_step: int, shortfall: dict[int, int]):
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=num_prompts_per_step,
+            )
+        )
+        ctrl._batch_shortfall = dict(shortfall)
+        return ctrl
+
+    def test_an_untouched_step_waits_for_the_configured_batch(self):
+        ctrl = self._controller(8, {})
+        assert ctrl._target_groups_for_step(3) == 8
+
+    def test_a_dropped_group_shrinks_only_the_step_it_was_stamped_for(self):
+        ctrl = self._controller(8, {3: 2})
+        assert ctrl._target_groups_for_step(3) == 6
+        assert ctrl._target_groups_for_step(4) == 8, "neighbouring steps unaffected"
+
+    def test_a_step_stripped_of_every_group_is_an_error_not_an_empty_step(self):
+        """Training on nothing is not a smaller step, and the budgets should have
+        failed the run long before the last group of a step was dropped."""
+        ctrl = self._controller(4, {0: 4})
+        with pytest.raises(RuntimeError, match="nothing to train on"):
+            ctrl._target_groups_for_step(0)
+
+
 def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
     async def _main() -> None:
         fresh = asyncio.create_task(asyncio.Event().wait())

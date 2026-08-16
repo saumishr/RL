@@ -49,6 +49,7 @@ class TestDefaultsAreInert:
         assert cfg.backoff_base_s == 1.0
         assert cfg.max_backoff_s == 30.0
         assert cfg.max_skipped_prompts == 0
+        assert cfg.max_consecutive_dropped_prompts == 0
         assert cfg.nemo_gym.max_row_attempts == 3
 
     def test_watchdog_has_documented_defaults(self):
@@ -92,6 +93,15 @@ class TestRolloutFailureValidation:
         validator existed purely to reject that one combination.
         """
         assert RolloutFailureConfig().max_skipped_prompts == 0
+
+    def test_a_consecutive_drop_budget_is_accepted(self):
+        cfg = RolloutFailureConfig(max_consecutive_dropped_prompts=4)
+        assert cfg.max_consecutive_dropped_prompts == 4
+
+    def test_the_two_drop_budgets_are_independent_knobs(self):
+        """Tolerating a bad dataset must not imply tolerating a dying fleet."""
+        cfg = RolloutFailureConfig(max_skipped_prompts=100)
+        assert cfg.max_consecutive_dropped_prompts == 0
 
     @pytest.mark.parametrize("attempts", [0, -1])
     def test_non_positive_attempt_budgets_are_rejected(self, attempts):
