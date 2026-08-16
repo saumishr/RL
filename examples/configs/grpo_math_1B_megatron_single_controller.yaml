@@ -54,6 +54,19 @@ async_rl:
     # this is what guarantees the gradient is computed from most of a batch. The floor
     # is ceil(fraction * num_prompts_per_step), so small batches tolerate no drops.
     min_step_batch_fraction: 0.9
+    # What happens to the step a dropped prompt was stamped for (in_order sampler only;
+    # an unstamped sampler strands nothing). "shrink" trains the step on fewer groups,
+    # bounded by the floor above. "replace" substitutes a fresh prompt so the step keeps
+    # its configured batch size -- what the v1 stack does -- and still shrinks if the
+    # attempts or spares below run out. When a later step already has a finished group,
+    # replace borrows it to close the dropped step immediately and sends the fresh
+    # prompt to repay that step instead, so the trainer does not idle waiting on a new
+    # rollout; promoted_prompt_groups reports when that happened.
+    on_dropped_prompt: shrink         # shrink | replace
+    max_replacement_attempts: 1       # fresh prompts tried per lost group
+    # Low-water mark for the spare-prompt pool. Refilled by diverting one whole batch
+    # from the dataloader before it is admitted, so a refill yields a batch of spares.
+    replacement_reserve_prompts: 1
 
     # Deadlines. null disables, which is the default and reproduces the historical
     # behaviour of waiting forever. Set them in any run that matters: without one a

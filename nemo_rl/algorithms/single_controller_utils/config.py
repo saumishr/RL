@@ -94,6 +94,10 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     lifetime. Infra exhaustion is a property of the fleet at a moment in time, so
     ``max_consecutive_dropped_prompts`` resets on every success: an outage that ends is
     absorbed, one that does not stops the run.
+
+    Once a prompt has been given up on, ``on_dropped_prompt`` decides what happens to
+    the training step it was stamped for: train the step on fewer groups, or substitute
+    a fresh prompt so the step keeps its configured batch size.
     """
 
     # ── shared: consumed by generate_and_push, above the impl split ──
@@ -148,6 +152,47 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # and should not be treated like losing 1 of 128. The floor is ceil(fraction * N),
     # so at the default a batch of 8 or fewer tolerates no drops at all.
     min_step_batch_fraction: float = Field(default=0.9, gt=0.0, le=1.0)
+    # What becomes of the training step a given-up prompt was stamped for. Only stamped
+    # prompts are affected: with a sampler that does not stamp (WeightFifoSampler,
+    # whose admit returns None) a step fills from whatever is ready, so a drop costs
+    # throughput but strands nothing and there is nothing to substitute for.
+    #
+    # "shrink" (the default, and the behaviour before this knob existed) closes the step
+    # on fewer groups, bounded by min_step_batch_fraction above.
+    #
+    # "replace" dispatches a fresh prompt so the step trains on the batch size that was
+    # configured. This is what both the v1 stack and verl do -- v1 discards the whole
+    # batch and regenerates it, verl's async path evicts the failed group and refills.
+    # It is bounded by max_replacement_attempts and by the spare pool below, and falls
+    # back to shrinking when either runs out; without that fallback a step whose
+    # replacements keep failing would never close at all.
+    #
+    # Where the fresh prompt is *sent* is an optimization, not a knob. If a later step
+    # already has a finished group, that group is re-stamped into the step that was
+    # dropped from -- which therefore closes immediately rather than waiting out a
+    # rollout while the trainer idles -- and the fresh prompt repays the lender, which
+    # is not due for another training step and has the slack to receive it. When no such
+    # group exists the fresh prompt fills the dropped step directly. Both paths hold the
+    # batch size; asking for the slower one is not a choice worth exposing, so the
+    # counters (promoted_prompt_groups, replaced_prompt_groups) report which one ran
+    # instead of a mode selecting it.
+    on_dropped_prompt: Literal["shrink", "replace"] = "shrink"
+    # Fresh prompts to substitute for one lost group before giving up and shrinking the
+    # step. Read only when on_dropped_prompt="replace".
+    max_replacement_attempts: NonNegativeInt = 1
+    # Low-water mark for the pool of spare prompts that replacements are drawn from. A
+    # threshold rather than a size because the pool is refilled by diverting one whole
+    # dataloader batch, so a single refill yields a batch worth of spares.
+    #
+    # The pool exists because the refill has to happen on the pump loop: it is the sole
+    # consumer of the StatefulDataLoader, and pulling from that iterator inside a
+    # dispatch task -- which is where a drop is discovered, arbitrarily later -- would
+    # race the iteration order that checkpoint/resume accounting depends on. Diverting
+    # happens before admit(), so a diverted batch never burns a target step.
+    #
+    # Read only when on_dropped_prompt="replace". Borrowing draws on it too: a group is
+    # only ever taken from a later step when a spare is in hand to repay that step.
+    replacement_reserve_prompts: NonNegativeInt = 1
     # ── path-specific ──
     native: NativeRolloutFTConfig = Field(default_factory=NativeRolloutFTConfig)
     nemo_gym: NemoGymRolloutFTConfig = Field(default_factory=NemoGymRolloutFTConfig)
@@ -159,6 +204,25 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
                 f"async_rl.rollout_failure.max_backoff_s ({self.max_backoff_s}) must be "
                 f">= backoff_base_s ({self.backoff_base_s})"
             )
+        # Both of these would leave on_dropped_prompt="replace" configured but unable to
+        # ever produce a replacement, so it would quietly behave as "shrink". Rejected
+        # rather than tolerated: the whole point of asking for "replace" is the batch
+        # size guarantee, and losing it silently is the failure mode worth preventing.
+        if self.on_dropped_prompt == "replace":
+            if self.max_replacement_attempts < 1:
+                raise ValueError(
+                    "async_rl.rollout_failure.on_dropped_prompt='replace' requires "
+                    "max_replacement_attempts >= 1, got "
+                    f"{self.max_replacement_attempts}; at 0 no replacement is ever "
+                    "dispatched, which is on_dropped_prompt='shrink'"
+                )
+            if self.replacement_reserve_prompts < 1:
+                raise ValueError(
+                    "async_rl.rollout_failure.on_dropped_prompt='replace' requires "
+                    "replacement_reserve_prompts >= 1, got "
+                    f"{self.replacement_reserve_prompts}; at 0 the spare pool is never "
+                    "refilled, so every replacement falls back to shrinking"
+                )
         return self
 
     @model_validator(mode="after")
