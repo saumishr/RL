@@ -50,6 +50,7 @@ class TestDefaultsAreInert:
         assert cfg.max_backoff_s == 30.0
         assert cfg.max_skipped_prompts == 0
         assert cfg.max_consecutive_dropped_prompts == 0
+        assert cfg.min_step_batch_fraction == 0.9
         assert cfg.nemo_gym.max_row_attempts == 3
 
     def test_watchdog_has_documented_defaults(self):
@@ -102,6 +103,15 @@ class TestRolloutFailureValidation:
         """Tolerating a bad dataset must not imply tolerating a dying fleet."""
         cfg = RolloutFailureConfig(max_skipped_prompts=100)
         assert cfg.max_consecutive_dropped_prompts == 0
+
+    @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
+    def test_an_out_of_range_step_floor_is_rejected(self, fraction):
+        """0 would permit an empty step; above 1 could never be satisfied."""
+        with pytest.raises(ValidationError):
+            RolloutFailureConfig(min_step_batch_fraction=fraction)
+
+    def test_a_full_step_floor_is_allowed_and_forbids_shrinking(self):
+        assert RolloutFailureConfig(min_step_batch_fraction=1.0).min_step_batch_fraction
 
     @pytest.mark.parametrize("attempts", [0, -1])
     def test_non_positive_attempt_budgets_are_rejected(self, attempts):

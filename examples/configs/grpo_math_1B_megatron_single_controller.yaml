@@ -49,6 +49,11 @@ async_rl:
     # expensive to restart -- a step short a few groups still trains, and the count
     # only keeps climbing if nothing at all is coming back.
     max_consecutive_dropped_prompts: 0
+    # Smallest batch a step may train on, as a fraction of num_prompts_per_step.
+    # The budgets above are run-scoped and cannot bound how short one step gets, so
+    # this is what guarantees the gradient is computed from most of a batch. The floor
+    # is ceil(fraction * num_prompts_per_step), so small batches tolerate no drops.
+    min_step_batch_fraction: 0.9
 
     # Deadlines. null disables, which is the default and reproduces the historical
     # behaviour of waiting forever. Set them in any run that matters: without one a

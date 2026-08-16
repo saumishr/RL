@@ -323,7 +323,11 @@ class TestTargetGroupsForStep:
     """How many groups a step waits for, once some are known not to be coming."""
 
     @staticmethod
-    def _controller(num_prompts_per_step: int, shortfall: dict[int, int]):
+    def _controller(
+        num_prompts_per_step: int,
+        shortfall: dict[int, int],
+        fraction: float = 0.9,
+    ):
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._master_config = SimpleNamespace(
@@ -331,23 +335,46 @@ class TestTargetGroupsForStep:
                 num_prompts_per_step=num_prompts_per_step,
             )
         )
+        ctrl._async_cfg = SimpleNamespace(
+            rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction)
+        )
         ctrl._batch_shortfall = dict(shortfall)
         return ctrl
 
     def test_an_untouched_step_waits_for_the_configured_batch(self):
-        ctrl = self._controller(8, {})
-        assert ctrl._target_groups_for_step(3) == 8
+        ctrl = self._controller(128, {})
+        assert ctrl._target_groups_for_step(3) == 128
 
     def test_a_dropped_group_shrinks_only_the_step_it_was_stamped_for(self):
-        ctrl = self._controller(8, {3: 2})
-        assert ctrl._target_groups_for_step(3) == 6
-        assert ctrl._target_groups_for_step(4) == 8, "neighbouring steps unaffected"
+        ctrl = self._controller(128, {3: 2})
+        assert ctrl._target_groups_for_step(3) == 126
+        assert ctrl._target_groups_for_step(4) == 128, "neighbouring steps unaffected"
 
-    def test_a_step_stripped_of_every_group_is_an_error_not_an_empty_step(self):
-        """Training on nothing is not a smaller step, and the budgets should have
-        failed the run long before the last group of a step was dropped."""
-        ctrl = self._controller(4, {0: 4})
-        with pytest.raises(RuntimeError, match="nothing to train on"):
+    def test_a_step_below_the_floor_fails_rather_than_training_a_part_batch(self):
+        """The drop budgets are run-scoped and cannot bound one step's shrinkage."""
+        # floor = ceil(0.9 * 128) = 116, so 12 drops are allowed and 13 are not.
+        ctrl = self._controller(128, {0: 12})
+        assert ctrl._target_groups_for_step(0) == 116
+
+        ctrl = self._controller(128, {0: 13})
+        with pytest.raises(RuntimeError, match="below the floor of 116"):
+            ctrl._target_groups_for_step(0)
+
+    def test_a_small_batch_is_protected_more_strictly(self):
+        """Losing 1 of 4 is a 25% batch reduction; the fraction says no."""
+        ctrl = self._controller(4, {0: 1})
+        with pytest.raises(RuntimeError, match="below the floor of 4"):
+            ctrl._target_groups_for_step(0)
+
+    def test_a_step_stripped_of_every_group_never_reaches_an_empty_batch(self):
+        """ceil() with a positive fraction keeps the floor >= 1, so this is caught."""
+        ctrl = self._controller(4, {0: 4}, fraction=0.01)
+        with pytest.raises(RuntimeError, match="leaving 0"):
+            ctrl._target_groups_for_step(0)
+
+    def test_a_fraction_of_one_forbids_shrinking_at_all(self):
+        ctrl = self._controller(128, {0: 1}, fraction=1.0)
+        with pytest.raises(RuntimeError, match="below the floor of 128"):
             ctrl._target_groups_for_step(0)
 
 

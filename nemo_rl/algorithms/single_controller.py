@@ -35,6 +35,7 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from functools import partial
@@ -497,20 +498,33 @@ class SingleControllerActor:
         step beats a stalled run. The count is logged as ``dropped_prompt_groups`` so
         the batch size a step actually used is recoverable afterwards.
 
+        How much smaller is bounded by ``min_step_batch_fraction``, and that bound has
+        to live here because neither drop budget provides it. Both budgets are
+        run-scoped -- the consecutive counter is cleared by any commit, including
+        commits for other steps -- so drops landing on one step while other steps
+        succeed can shrink it without ever tripping them.
+
         Raises:
-            RuntimeError: Every prompt for the step was dropped. An empty step is not a
-                smaller step, and the retry and consecutive-drop budgets should have
-                failed the run long before it could happen.
+            RuntimeError: The step fell below ``min_step_batch_fraction`` of
+                ``num_prompts_per_step``. Training a fraction of a batch is a silent
+                change to the gradient estimate, so it is refused rather than absorbed.
         """
+        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
         dropped = self._batch_shortfall.get(step, 0)
-        target = self._master_config.grpo.num_prompts_per_step - dropped
-        if target < 1:
+        target = num_prompts_per_step - dropped
+        fraction = self._async_cfg.rollout_failure.min_step_batch_fraction
+        # ceil, so the floor is never rounded down into allowing one more drop than the
+        # fraction states. With fraction > 0 this is always >= 1, which also rules out
+        # the empty step.
+        floor = math.ceil(num_prompts_per_step * fraction)
+        if target < floor:
             raise RuntimeError(
-                f"every prompt group for training step {step} was dropped "
-                f"({dropped} of {self._master_config.grpo.num_prompts_per_step}); "
-                "there is nothing to train on. Lower "
-                "async_rl.rollout_failure.max_consecutive_dropped_prompts so the run "
-                "fails while the fleet is still partially answering."
+                f"training step {step} lost {dropped} of {num_prompts_per_step} prompt "
+                f"group(s), leaving {target}, below the floor of {floor} set by "
+                f"async_rl.rollout_failure.min_step_batch_fraction={fraction}. "
+                "Either the generation fleet is failing a whole step's worth of "
+                "prompts, or the drop budgets are set too high to catch it: they are "
+                "run-scoped and cannot bound how short a single step gets."
             )
         return target
 

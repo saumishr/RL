@@ -133,6 +133,21 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # shared counter would let a bad dataset consume the allowance that exists to ride
     # out a shard outage, which is the one distinction the failure taxonomy draws.
     max_consecutive_dropped_prompts: NonNegativeInt = 0
+    # Smallest batch a training step may close on, as a fraction of
+    # num_prompts_per_step. Below it the run fails instead of training the step.
+    #
+    # Neither drop budget bounds this on its own. Both are properties of the run:
+    # max_skipped_prompts is a lifetime total, and the consecutive counter is cleared by
+    # any commit at all, including commits belonging to other steps. So drops
+    # concentrated on one step, interleaved with unrelated successes, keep resetting the
+    # counter while that one step shrinks without limit -- and a step is what the
+    # gradient is actually computed from.
+    #
+    # A fraction rather than a count so it holds across batch sizes, and so small
+    # batches are protected more strictly: losing 1 group of 4 is a 25% batch reduction
+    # and should not be treated like losing 1 of 128. The floor is ceil(fraction * N),
+    # so at the default a batch of 8 or fewer tolerates no drops at all.
+    min_step_batch_fraction: float = Field(default=0.9, gt=0.0, le=1.0)
     # ── path-specific ──
     native: NativeRolloutFTConfig = Field(default_factory=NativeRolloutFTConfig)
     nemo_gym: NemoGymRolloutFTConfig = Field(default_factory=NemoGymRolloutFTConfig)

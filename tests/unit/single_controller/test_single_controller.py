@@ -352,7 +352,10 @@ def _train_pump_controller(*, sampler) -> object:
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
     )
-    ctrl._async_cfg = SimpleNamespace(min_groups_for_streaming_train=1)
+    ctrl._async_cfg = SimpleNamespace(
+        min_groups_for_streaming_train=1,
+        rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
+    )
     ctrl._consumed_samples = 0
     ctrl._total_valid_tokens = 0
     ctrl._timeout = TimeoutChecker(timeout=None, fit_last_save_time=True)
