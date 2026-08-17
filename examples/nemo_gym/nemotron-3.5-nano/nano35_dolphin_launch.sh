@@ -161,16 +161,31 @@ export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservi
 
 # -----------------------------------------------------------------------------
 # Containers
-# Built from public main on 2026-07-30 with prebaked venvs, on vllm 0.25.1.
+# Built 2026-08-15 with prefetched venvs, on vllm 0.25.1.
 #
-# The 2026-07-26 image that used to be the default here carries vllm 0.20.0,
-# which no longer satisfies HEAD: vllm_worker_async.py imports
+# The image supplies Megatron, and that is why this pin has to track the repo.
+# ultra_launch.sh overlays only nemo_rl/, examples/configs and Gym from the
+# worktree, so megatron.core always comes from the container. `46ab18ce1 ci: bump
+# Megatron-Bridge to 0c565c9a0 (#3568)` landed on main 2026-08-11 and made
+# megatron_policy_worker.py import FullyShardedDataParallelV1, which no image
+# built before that date has -- including the 2026-07-30 one that used to be the
+# default here and the 2026-08-07 main build. Both fail at
+# `from megatron.core.distributed.fsdp.mcore_fsdp_adapter import ...` while the
+# Megatron workers come up, ~20 min in (job 6231494). To check a candidate before
+# spending an allocation on it:
+#
+#   unsquashfs -l <image> | grep mcore_fsdp_adapter
+#   unsquashfs -d /tmp/probe -f <image> \
+#     opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/\
+# Megatron-LM/megatron/core/distributed/fsdp/mcore_fsdp_adapter.py
+#
+# Keep vllm >= 0.25.1 when moving this pin: vllm_worker_async.py imports
 # ServingTokenization from vllm.entrypoints.serve.tokenize.serving, added in
-# 0.25.x. Missing it kills every generation worker at engine init, and it does
-# so ~25 minutes in, after the judges and the Megatron workers have already
-# loaded. Jobs 5942981 and 5981739 both died that way.
+# 0.25.x, and a 0.20.0 image kills every generation worker at engine init ~25 min
+# in, after the judges and the Megatron workers have already loaded (jobs 5942981
+# and 5981739).
 # -----------------------------------------------------------------------------
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:main_ultra_recipes_prebaked_venvs_20260730.squashfs}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:super35_merge_20260815_prefetched_venvs_arm64.squashfs}"
 
 # -----------------------------------------------------------------------------
 # Sandbox process DISABLED — this is what killed jobs 5726250 and 5732681.
