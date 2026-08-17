@@ -867,6 +867,28 @@ if [[ ! -f "${PROJECT_ROOT}/${TRAIN_ENTRYPOINT#./}" ]]; then
   exit 1
 fi
 
+# UV_CACHE_DIR points at the warm cache the container already ships at
+# /root/.cache/uv, rather than /tmp/nemo-gym-uv-cache-${SLURM_JOB_ID:-default},
+# which breaks twice over:
+#
+#   - ray.sub scrubs every SLURM_* variable before entering the head container,
+#     so the job-id suffix always collapses to "default"; and /tmp is node-local
+#     and wiped, so the cache is cold on every node of every job by construction.
+#   - Worse, pointing uv at /tmp discards the image's own cache, which holds git
+#     databases for all 13 git dependencies plus the vllm and flash-attn wheels,
+#     so every job re-clones and re-downloads roughly 700 MB from github.
+#
+# Any run that mounts a Gym differing from the baked one pays this: the mismatch
+# invalidates the lock and forces a re-resolve, and with a cold cache that
+# re-resolve has to reach github from a compute node. It cost ~26 min of startup
+# in jobs 6231494/6232802/6233682, and earlier killed 6071350, 6071353 and
+# 6071948 outright when a clone timed out at ~134s.
+#
+# Set explicitly rather than simply unset: sbatch --export=ALL carries an
+# inherited UV_CACHE_DIR from the submitting shell all the way into the
+# container, so relying on uv's default is not enough. Verified in job 6072555 --
+# with github made unreachable, the /tmp arm failed exactly as in production and
+# this arm resolved and synced clean.
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
@@ -876,7 +898,7 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
+UV_CACHE_DIR=/root/.cache/uv \
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
