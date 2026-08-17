@@ -20,19 +20,50 @@
 defaults: rlvr_dolphin.yaml
 
 # =============================================================================
-# Checkpointing — must be off
+# Checkpointing — on, because a 100-step run outlives the 4 h wall
 # =============================================================================
-# setup_single_controller raises NotImplementedError when checkpointing.enabled
-# is true (single_controller_utils/setup.py). Saving is still a TODO on the SC
-# path, so this run cannot resume across the wall clock. Partition `batch` caps
-# at 4 h: size grpo.max_num_steps (NRL_MAX_STEPS) to fit one allocation.
+# The SC path saves and resumes now: _save_checkpoint writes policy weights, the
+# optimizer, the tokenizer, the dataloader state, the replay buffer and the
+# step/epoch/consumed-sample counters, and setup_single_controller resumes from
+# get_latest_checkpoint_path. Restoring the buffer matters more here than the
+# weights do -- a resumed run comes back with its lag-4 staleness distribution
+# instead of ramping from zero, so the convergence curve has no seam at the job
+# boundary. The buffer restore is skipped if the sampler name changed, so every
+# job in a chain must keep the same async_rl.sampler.name.
 #
-# The inherited checkpoint_must_save_by / save_period / save_optimizer keys are
-# inert with checkpointing disabled and are left as-is so the diff against the
-# baseline stays limited to the SC wiring.
+# grpo.max_num_steps is compared against the *restored* step count, so it is a
+# whole-campaign target: NRL_MAX_STEPS=100 once, and each requeued job continues
+# toward it rather than running 100 more steps.
+#
+# Three inherited values are wrong the moment this is enabled:
+#
+#   metric_name    student_rlvr1.yaml sets "val:total_reward/mean", which
+#                  validate_single_controller_config rejects outright -- SC has
+#                  no validation loop, so a "val:" metric is never collected and
+#                  top-k retention would silently degrade to a no-op. null here
+#                  makes retention purely recency-based, which is what we want.
+#   ft_save_period Inherited as 1, and should_save_by_step ORs it with
+#                  save_period, so every single step would write a full MoE
+#                  checkpoint. Pinned to save_period so the two agree.
+#   keep_top_k     Inherited as 1000000, i.e. keep everything. With no metric,
+#                  "best" is recency, so this keeps the newest 3 periodic
+#                  checkpoints and lets the rest go. 100 steps at save_period 5
+#                  would otherwise leave 20 full checkpoints on disk.
+#
+# checkpoint_must_save_by comes from the launcher (CHECKPOINTING_SAVE_BY,
+# 00:03:35:00) and forces a save before the 4 h wall regardless of save_period.
+# save_period 5 is the baseline's value, chosen so a job that dies mid-window
+# loses at most 5 steps; revisit once step time at lag 4 is measured, since a
+# job that never reaches a save redoes the same work on every requeue.
 # =============================================================================
 checkpointing:
-  enabled: false
+  enabled: true
+  metric_name: null
+  save_period: 5
+  ft_save_period: 5
+  ft_keep_latest_k: 1
+  keep_top_k: 3
+  save_optimizer: true
 
 grpo:
   # setup_single_controller rejects val_period > 0 outright, so the baseline's
