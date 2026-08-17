@@ -43,9 +43,13 @@ grpo:
   # val_period=-1 / val_at_start=false / val_at_end=false are inherited and
   # already satisfy the SC guard (it rejects val_period > 0). No change needed.
   #
-  # grpo.async_grpo is inherited and dead on this path — SC never reads it —
-  # but env.nemo_gym interpolates ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1}
-  # for num_groups_nemo_rl, so removing the block would break config load.
+  # run_grpo_single_controller.py raises unless this is null; the SC knobs live
+  # under async_rl. pipeclean_6k.yaml interpolates
+  # ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1} for num_groups_nemo_rl
+  # in two places, so both are pinned to the value that interpolation resolved
+  # to (max_trajectory_age_steps: 1) under env.nemo_gym below. Nothing may
+  # reference this block once it is null or config load fails.
+  async_grpo: null
 
 policy:
   # ---------------------------------------------------------------------------
@@ -191,6 +195,17 @@ async_rl:
 # =============================================================================
 env:
   nemo_gym:
+    # Pinned literals for what pipeclean_6k.yaml interpolated off
+    # grpo.async_grpo.max_trajectory_age_steps, which is null on this path.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_groups_nemo_rl: 2
+    policy_model_reasoning_off:
+      responses_api_models:
+        vllm_model:
+          num_groups_nemo_rl: 2
+
     # Ray's max_concurrency for the single NemoGym actor. This shape offers 5120
     # in-flight prompts and each one is a single run_rollouts call on that
     # actor, so at Ray's async default of 1000 the surplus queued at the raylet

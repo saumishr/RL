@@ -78,9 +78,13 @@ grpo:
   # AttributeError: 'MegatronPolicyWorker' has no 'reference_state_dict'.
   skip_reference_policy_logprobs_calculation: true
 
-  # grpo.async_grpo is inherited and dead on this path — SC never reads it —
-  # but env.nemo_gym interpolates ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1}
-  # for num_groups_nemo_rl, so removing the block would break config load.
+  # run_grpo_single_controller.py raises unless this is null; the SC knobs live
+  # under async_rl. student_rlvr1.yaml interpolates
+  # ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1} for num_groups_nemo_rl
+  # in two places, so both are pinned to the value that interpolation resolved
+  # to (max_trajectory_age_steps: 1) under env.nemo_gym below. Nothing may
+  # reference this block once it is null or config load fails.
+  async_grpo: null
 
 policy:
   # ---------------------------------------------------------------------------
@@ -327,6 +331,17 @@ async_rl:
 # =============================================================================
 env:
   nemo_gym:
+    # Pinned literals for what student_rlvr1.yaml interpolated off
+    # grpo.async_grpo.max_trajectory_age_steps, which is null on this path.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_groups_nemo_rl: 2
+    policy_model_reasoning_off:
+      responses_api_models:
+        vllm_model:
+          num_groups_nemo_rl: 2
+
     # Ray's max_concurrency for the single NemoGym actor: the ceiling on rollout
     # tasks it executes at once. NemoGym.run_rollouts is `async def`, so the
     # actor takes Ray's asyncio branch. Tasks past the cap queue at the
