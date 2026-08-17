@@ -161,7 +161,7 @@ export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservi
 
 # -----------------------------------------------------------------------------
 # Containers
-# Built 2026-08-15 with prefetched venvs, on vllm 0.25.1.
+# Built 2026-08-14 with prefetched venvs, on vllm 0.25.1.
 #
 # The image supplies Megatron, and that is why this pin has to track the repo.
 # ultra_launch.sh overlays only nemo_rl/, examples/configs and Gym from the
@@ -184,8 +184,34 @@ export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservi
 # 0.25.x, and a 0.20.0 image kills every generation worker at engine init ~25 min
 # in, after the judges and the Megatron workers have already loaded (jobs 5942981
 # and 5981739).
+#
+# The image's vllm and its nvidia-cutlass-dsl also have to agree, which is why
+# this is the 08-14 build and not the 08-15 one that first got us past the
+# Megatron import. The 08-15 image carries vllm 0.25.1+precompiled, whose
+# vllm/vllm_flash_attn/cute/utils.py adds
+# `from cutlass._mlir_helpers.arith import recast_type`; the cutlass-dsl 4.5.2
+# it ships exposes that module only as cutlass.base_dsl._mlir_helpers, so the
+# import raises ModuleNotFoundError. utils.py is imported lazily, from the FA4
+# branch of flash_attn_varlen_func, so nothing surfaces until the first real
+# attention forward: engine init and the weight sync both succeed, then every
+# TP worker dies on the first rollout wave, EngineCore goes down, every
+# generation 500s and the infra budget aborts the run ~3 min into serving (jobs
+# 6233682 and 6234556, which is also where the scheduler's req_id_to_index
+# KeyError came from -- collateral from the workers dying mid-batch, not a
+# cause). FA4 is the default on these GB200s, so there is no getting to it.
+# Add to the candidate probe above:
+#
+#   unsquashfs -d /tmp/probe -f <image> \
+#     opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.\
+# VllmAsyncGenerationWorker/lib/python3.13/site-packages/vllm/vllm_flash_attn/\
+# cute/utils.py
+#   # follow the symlink into /root/.cache/uv, then:
+#   grep -n 'from cutlass' <extracted utils.py>   # must not name _mlir_helpers
+#
+# The 07-30 image passes that check but fails the Megatron one; 08-14 is the
+# only build in yifuw's directory that passes both.
 # -----------------------------------------------------------------------------
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:super35_merge_20260815_prefetched_venvs_arm64.squashfs}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:omni_mopd_20260814_prefetched_venvs_arm64.squashfs}"
 
 # -----------------------------------------------------------------------------
 # Sandbox process DISABLED — this is what killed jobs 5726250 and 5732681.

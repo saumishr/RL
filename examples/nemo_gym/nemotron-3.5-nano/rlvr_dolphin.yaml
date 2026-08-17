@@ -302,15 +302,17 @@ env:
         local_vllm_model:
           model: /lustre/fsw/portfolios/llmservice/users/ansubramania/super_v3/model_checkpoints/Nemotron-Content-Safety-Reasoning-4B
           vllm_serve_env_vars:
-            # The container bakes VLLM_USE_FASTOKENS=1 into /etc/environment, so
+            # Some images bake VLLM_USE_FASTOKENS=1 into /etc/environment, so
             # every process inherits it, but only the RL venv carries the wheel
             # (fastokens 0.3.1). This judge has no ray_worker_py_executable, so
             # it runs from the Gym venv, whose vLLM ships the integration module
             # (vllm/tokenizers/fastokens.py) without the package behind it, and
             # exits at import with "The 'fastokens' package (>= 0.2.0) is
             # required when VLLM_USE_FASTOKENS=1" -- taking Gym spinup down with
-            # it (job 6232802). The Jul-30 image's Gym vLLM had no fastokens
-            # support at all and ignored the flag, which is why this is new.
+            # it (job 6232802, on the 08-15 build). The Jul-30 image's Gym vLLM
+            # had no fastokens support at all and ignored the flag, which is why
+            # this appeared only once the pin moved forward. Pinned off rather
+            # than left to the image so a future pin cannot reintroduce it.
             # Merged onto the base's env vars rather than replacing them.
             VLLM_USE_FASTOKENS: "0"
           vllm_serve_kwargs:
