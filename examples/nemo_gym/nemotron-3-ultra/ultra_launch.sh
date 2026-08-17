@@ -89,7 +89,11 @@ set -euo pipefail
 : "${TRAIN_PATH:?TRAIN_PATH is required (training data jsonl path)}"
 : "${VAL_PATH:?VAL_PATH is required (validation data jsonl path)}"
 : "${CONTAINER:?CONTAINER is required (NGC image URI or .sqsh path)}"
-: "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image)}"
+# Set it empty to disable the colocated sandbox: ray.sub starts the sandbox only
+# when SANDBOX_CONTAINER and SANDBOX_COMMAND are both non-empty, and a blend that
+# routes to none of the three sandbox-backed Gym servers does not need it. Hence
+# `?` rather than `:?` -- unset is still an error, empty is a deliberate opt-out.
+: "${SANDBOX_CONTAINER?SANDBOX_CONTAINER is required (nemo-skills sandbox image; set it empty to disable the sandbox)}"
 : "${PERSISTENT_CACHE:?PERSISTENT_CACHE is required (Lustre dir for vLLM/Triton/Inductor caches)}"
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
 : "${SLURM_ACCOUNT:?SLURM_ACCOUNT is required}"
@@ -855,6 +859,14 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+# SingleController recipes swap this for ./examples/run_grpo_single_controller.py.
+# Both drivers accept the same --config and Hydra override surface.
+TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
+if [[ ! -f "${PROJECT_ROOT}/${TRAIN_ENTRYPOINT#./}" ]]; then
+  echo "ERROR: TRAIN_ENTRYPOINT does not exist: ${TRAIN_ENTRYPOINT}" >&2
+  exit 1
+fi
+
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
@@ -875,7 +887,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+uv run ${TRAIN_ENTRYPOINT} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
@@ -913,6 +925,7 @@ echo "  Nemotron 3 Ultra — ${EXP_NAME} (${NUM_TOTAL_NODES}-node)"
 echo "================================================================"
 echo "  Job name:    ${JOB_NAME}  (singleton — only one runs at a time)"
 echo "  Config:      ${CONFIG_PATH}"
+echo "  Entrypoint:  ${TRAIN_ENTRYPOINT}"
 echo "  Nodes:       ${NUM_TOTAL_NODES} total"
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "    Hetgroup 0: ${NUM_RAY_NODES} NeMo RL nodes  (segment=${SEGMENT_SIZE})"

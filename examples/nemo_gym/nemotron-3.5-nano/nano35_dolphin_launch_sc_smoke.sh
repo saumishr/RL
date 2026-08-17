@@ -112,7 +112,18 @@ echo "  parallelism: TP4 x CP4 x EP8 x PP1 (ETP1) — unchanged, DP 2 -> 1"
 echo "  batch: prompts=${NUM_PROMPTS_PER_STEP}, generations=16, global=${TRAIN_GLOBAL_BATCH_SIZE}"
 echo "  steps: ${NRL_MAX_STEPS}"
 
+# The per-step floor is a fraction of the cohort, and the cohort is what this
+# profile shrinks, so the recipe's production value does not survive the scaling:
+# the floor is ceil(num_prompts_per_step * fraction), which at 0.9 of 8 is 8 --
+# every prompt required, so the first drop that survives replacement aborts the
+# run. At the full 128 the same fraction tolerates 12. Scale it back to something
+# a cohort of 8 can express: ceil(8 * 0.75) = 6, so two drops are absorbed and an
+# emptier batch is still refused. Only the in_order arm can reach this at all --
+# ready_first does not stamp a target step, so nothing is ever credited short.
+MIN_STEP_BATCH_FRACTION="${MIN_STEP_BATCH_FRACTION:-0.75}"
+
 exec bash "${SCRIPT_DIR}/nano35_dolphin_launch_sc.sh" \
   "grpo.num_prompts_per_step=${NUM_PROMPTS_PER_STEP}" \
   "policy.train_global_batch_size=${TRAIN_GLOBAL_BATCH_SIZE}" \
+  "async_rl.rollout_failure.min_step_batch_fraction=${MIN_STEP_BATCH_FRACTION}" \
   "$@"
