@@ -501,7 +501,12 @@ def _train_pump_controller(*, sampler) -> object:
     # Read only by the select-stall warning, which reports what the pump is
     # waiting on.
     ctrl._inflight_rollouts = 0
-    ctrl._rollout_manager = SimpleNamespace(stats=SimpleNamespace(skipped=0))
+    # stats.skipped is what the select-stall warning reports; the empty timing
+    # pool is what the step-close postprocess-share report no-ops on.
+    ctrl._rollout_manager = SimpleNamespace(
+        stats=SimpleNamespace(skipped=0),
+        rollout_timing=NemoGymRolloutTiming(),
+    )
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._rollout_exhausted.set()
@@ -514,8 +519,6 @@ def _train_pump_controller(*, sampler) -> object:
         clear_logger_metrics=lambda: None,
     )
     ctrl._loss_fn = None
-    # No group has landed, so the step-close postprocess-share report no-ops too.
-    ctrl._rollout_manager = SimpleNamespace(rollout_timing=NemoGymRolloutTiming())
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
