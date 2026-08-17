@@ -51,6 +51,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutStats,
 )
+from nemo_rl.experience.rollout_timing import NemoGymRolloutTiming
 
 
 class _Buffer:
@@ -78,6 +79,14 @@ class _Buffer:
         return 1
 
 
+class _Record:
+    """Stand-in for PromptGroupRecord, carrying the metrics the manager pools."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.rollout_metrics: dict[str, float] = {}
+
+
 class _ScriptedImpl:
     """Rollout impl that raises a scripted sequence of failures, then succeeds."""
 
@@ -93,7 +102,7 @@ class _ScriptedImpl:
             failure = self._failures[index]
             if failure is not None:
                 raise failure
-        return f"record-{index}"
+        return _Record(f"record-{index}")
 
 
 def _make_manager(buffer, impl, policy) -> RolloutManager:
@@ -105,6 +114,7 @@ def _make_manager(buffer, impl, policy) -> RolloutManager:
     manager._weight_version = 0
     manager._retry_policy = policy
     manager._stats = RolloutStats()
+    manager._rollout_timing = NemoGymRolloutTiming()
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
     return manager
