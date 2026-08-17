@@ -49,6 +49,11 @@ class TestDefaultsAreInert:
         assert cfg.backoff_base_s == 1.0
         assert cfg.max_backoff_s == 30.0
         assert cfg.max_skipped_prompts == 0
+        assert cfg.max_consecutive_dropped_prompts == 0
+        assert cfg.min_step_batch_fraction == 0.9
+        assert cfg.on_dropped_prompt == "shrink"
+        assert cfg.max_replacement_attempts == 1
+        assert cfg.replacement_reserve_prompts == 1
         assert cfg.nemo_gym.max_row_attempts == 3
 
     def test_watchdog_has_documented_defaults(self):
@@ -92,6 +97,72 @@ class TestRolloutFailureValidation:
         validator existed purely to reject that one combination.
         """
         assert RolloutFailureConfig().max_skipped_prompts == 0
+
+    def test_a_consecutive_drop_budget_is_accepted(self):
+        cfg = RolloutFailureConfig(max_consecutive_dropped_prompts=4)
+        assert cfg.max_consecutive_dropped_prompts == 4
+
+    def test_the_two_drop_budgets_are_independent_knobs(self):
+        """Tolerating a bad dataset must not imply tolerating a dying fleet."""
+        cfg = RolloutFailureConfig(max_skipped_prompts=100)
+        assert cfg.max_consecutive_dropped_prompts == 0
+
+    @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
+    def test_an_out_of_range_step_floor_is_rejected(self, fraction):
+        """0 would permit an empty step; above 1 could never be satisfied."""
+        with pytest.raises(ValidationError):
+            RolloutFailureConfig(min_step_batch_fraction=fraction)
+
+    def test_a_full_step_floor_is_allowed_and_forbids_shrinking(self):
+        assert RolloutFailureConfig(min_step_batch_fraction=1.0).min_step_batch_fraction
+
+    def test_replace_mode_is_opt_in(self):
+        """Shrinking is what the branch shipped with; replacing must be asked for."""
+        assert RolloutFailureConfig().on_dropped_prompt == "shrink"
+
+    @pytest.mark.parametrize("policy", ["regenerate", "promote"])
+    def test_an_unknown_drop_policy_is_rejected(self, policy):
+        """Borrowing is an optimization inside "replace", not a mode to select.
+
+        Both paths hold the batch size, so "please hold it the slower way" is not a
+        choice worth offering; promoted_prompt_groups reports which one ran.
+        """
+        with pytest.raises(ValidationError):
+            RolloutFailureConfig(on_dropped_prompt=policy)
+
+    @pytest.mark.parametrize(
+        ("field", "message"),
+        [
+            ("max_replacement_attempts", "max_replacement_attempts"),
+            ("replacement_reserve_prompts", "replacement_reserve_prompts"),
+        ],
+    )
+    def test_replace_mode_that_could_never_replace_is_rejected(self, field, message):
+        """Either zero leaves "replace" configured but behaving as "shrink".
+
+        Silently degrading is the failure worth catching: the only reason to ask for
+        replacement is the batch-size guarantee, so losing it without a word defeats
+        the point of setting the knob. The spare pool gates borrowing too, since a
+        group is only taken from a later step when a spare can repay it.
+        """
+        with pytest.raises(ValidationError, match=message):
+            RolloutFailureConfig(on_dropped_prompt="replace", **{field: 0})
+
+    def test_the_same_zeros_are_fine_while_shrinking(self):
+        """They are only read in replace mode, so shrink runs must not trip on them."""
+        cfg = RolloutFailureConfig(
+            max_replacement_attempts=0, replacement_reserve_prompts=0
+        )
+        assert cfg.on_dropped_prompt == "shrink"
+
+    def test_replace_mode_accepts_a_deeper_budget(self):
+        cfg = RolloutFailureConfig(
+            on_dropped_prompt="replace",
+            max_replacement_attempts=3,
+            replacement_reserve_prompts=16,
+        )
+        assert cfg.max_replacement_attempts == 3
+        assert cfg.replacement_reserve_prompts == 16
 
     @pytest.mark.parametrize("attempts", [0, -1])
     def test_non_positive_attempt_budgets_are_rejected(self, attempts):
