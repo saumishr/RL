@@ -106,7 +106,8 @@ def _check_container_fingerprint():
     since environment rebuilding will ensure dependencies are consistent regardless
     of a mismatch.
 
-    If there's a mismatch, raises RuntimeError unless NRL_IGNORE_VERSION_MISMATCH is set.
+    If there's a mismatch, logs a one-line warning unless
+    NRL_IGNORE_VERSION_MISMATCH is set.
     """
     # Skip check if not in container or if we're going to force venv rebuild anyway
     if not os.environ.get("NRL_CONTAINER"):
@@ -170,6 +171,7 @@ def _check_container_fingerprint():
 
         # Compare fingerprints and find differences
         all_keys = set(current_fingerprint.keys()) | set(container_fingerprint.keys())
+        mismatched_keys = []
         differences = []
 
         for key in sorted(all_keys):
@@ -177,43 +179,28 @@ def _check_container_fingerprint():
             container_val = container_fingerprint.get(key, "missing")
 
             if current_val != container_val:
+                mismatched_keys.append(key)
                 differences.append(f"  - {key}:")
                 differences.append(f"      Container: {container_val}")
                 differences.append(f"      Current:   {current_val}")
 
-        if differences:
-            diff_text = "\n".join(differences)
-            sep_line = "\n" + ("-" * 80)
-            warning_msg = (
-                f"{sep_line}\n"
-                "WARNING: Container/Code Version Mismatch Detected!\n"
-                f"{sep_line}\n"
-                "Your container's dependencies do not match your current code.\n"
-                "\n"
-                "Differences found:\n"
-                f"{diff_text}\n"
-                "\n"
-                "This can lead to unexpected behavior or errors.\n"
-                "\n"
-                "Solutions:\n"
-                "  1. Rebuild the container to match your code\n"
-                "  2. Set NRL_FORCE_REBUILD_VENVS=true to rebuild virtual environments\n"
-                "     (This forces Ray workers to recreate their venvs with updated dependencies)\n"
-                "  3. Update the container fingerprint to match your current code (for local dev):\n"
-                "     python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint\n"
-                "  4. Set NRL_IGNORE_VERSION_MISMATCH=1 to bypass this check (not recommended)\n"
-                "\n"
-                "Learn more about dependency management:\n"
-                "  https://github.com/NVIDIA-NeMo/RL/blob/main/docs/design-docs/dependency-management.md\n"
-                f"{sep_line}\n"
-            )
-
-            # Check if user wants to ignore the mismatch
-            if not bool(os.environ.get("NRL_IGNORE_VERSION_MISMATCH")):
+        if mismatched_keys:
+            # Emitted as a single-line record on purpose. Every Ray worker
+            # re-runs this check when it imports nemo_rl, and Ray prefixes
+            # each line of a record with "(pid=..., ip=...)", so a multi-line
+            # warning lands in the driver log once per worker process.
+            if not os.environ.get("NRL_IGNORE_VERSION_MISMATCH"):
                 logging.warning(
-                    warning_msg
-                    + "Proceeding anyway (NRL_IGNORE_VERSION_MISMATCH is set)..."
+                    "Container/code version mismatch in "
+                    f"[{', '.join(mismatched_keys)}]; this "
+                    "can cause unexpected behavior. Rebuild the container, set "
+                    "NRL_FORCE_REBUILD_VENVS=true, or see "
+                    "docs/design-docs/dependency-management.md. Set "
+                    "NRL_IGNORE_VERSION_MISMATCH=1 to silence this warning."
                 )
+            logging.debug(
+                "Container/code fingerprint differences:\n%s", "\n".join(differences)
+            )
         else:
             logging.debug("Container fingerprint matches code fingerprint")
 

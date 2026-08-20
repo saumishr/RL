@@ -282,39 +282,25 @@ NeMo RL containers enforce environment reproducibility by automatically checking
 - The **md5sum of `uv.lock`**
 - The **commit hashes of relevant submodules**
 
-If any of these values differ between your code and the container image, NeMo RL will alert you and show exactly what has changed:
+If any of these values differ between your code and the container image, NeMo RL warns you and names the entries that changed:
 
 ```text
---------------------------------------------------------------------------------
-WARNING: Container/Code Version Mismatch Detected!
-
---------------------------------------------------------------------------------
-Your container's dependencies do not match your current code.
-
-Differences found:
-  - pyproject.toml:
-      Container: abc123def456
-      Current:   xyz789abc012
-  - uv.lock:
-      Container: 0987f6543210
-      Current:   1234abcd5678
-  - submodules/3rdparty/ExampleSubmodule:
-      Container: a1b2c3d4e5f6
-      Current:   f6e5d4c3b2a1
-
-This can lead to unexpected behavior or errors.
-
-Solutions:
-  1. Rebuild the container to match your code
-  2. Set NRL_FORCE_REBUILD_VENVS=true to rebuild virtual environments
-     (This forces Ray workers to recreate their venvs with updated dependencies)
-  3. Set NRL_IGNORE_VERSION_MISMATCH=1 to bypass this check (not recommended)
-
-Learn more about dependency management:
-  https://github.com/NVIDIA-NeMo/RL/blob/main/docs/design-docs/dependency-management.md
-
---------------------------------------------------------------------------------
+WARNING:root:__init__.py:184: Container/code version mismatch in [pyproject.toml, uv.lock, submodules/3rdparty/ExampleSubmodule]; this can cause unexpected behavior. Rebuild the container, set NRL_FORCE_REBUILD_VENVS=true, or see docs/design-docs/dependency-management.md. Set NRL_IGNORE_VERSION_MISMATCH=1 to silence this warning.
 ```
+
+The warning is deliberately a single log line: every Ray worker re-runs this check when it imports `nemo_rl`, and Ray prefixes each line of a log record with `(pid=..., ip=...)`, so a multi-line record is repeated across the driver log once per worker process. To see the per-entry container and current hashes, raise the log level to `DEBUG`.
+
+To resolve a mismatch, pick one of:
+
+1. Rebuild the container to match your code.
+2. Set `NRL_FORCE_REBUILD_VENVS=true` to rebuild virtual environments (this forces Ray workers to recreate their venvs with updated dependencies).
+3. Update the container fingerprint to match your code, for local development only:
+
+   ```bash
+   python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
+   ```
+
+4. Set `NRL_IGNORE_VERSION_MISMATCH=1` to bypass the check (not recommended).
 
 This check **only runs in containers** (when `NRL_CONTAINER=1` is set) and can be bypassed if absolutely needed:
 

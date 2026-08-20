@@ -97,7 +97,7 @@ echo "" | cat - pyproject.toml > pyproject.toml.tmp && mv pyproject.toml.tmp pyp
 
 echo -n "  Testing python -c 'import nemo_rl' (should print warning) ... "
 IMPORT_OUTPUT=$(python -c "import nemo_rl" 2>&1 || true)
-if echo "$IMPORT_OUTPUT" | grep -q "WARNING: Container/Code Version Mismatch Detected"; then
+if echo "$IMPORT_OUTPUT" | grep -q "Container/code version mismatch"; then
     echo "✓ OK (warning printed as expected)"
 else
     echo "✗ FAILED"
@@ -130,7 +130,7 @@ else
         cd "$TEMP_DIR"
         echo -n "  Testing python -c 'import nemo_rl' (should print warning) ... "
         IMPORT_OUTPUT=$(python -c "import nemo_rl" 2>&1 || true)
-        if echo "$IMPORT_OUTPUT" | grep -q "WARNING: Container/Code Version Mismatch Detected"; then
+        if echo "$IMPORT_OUTPUT" | grep -q "Container/code version mismatch"; then
             echo "✓ OK (warning printed as expected)"
         else
             echo "✗ FAILED"

@@ -14,6 +14,7 @@
 
 """Tests for container version fingerprint checking."""
 
+import logging
 import os
 from pathlib import Path
 from unittest import mock
@@ -83,6 +84,81 @@ class TestContainerFingerprintCheck:
 
         # No exception raised
         assert True
+
+    @staticmethod
+    def _run_check_with_mismatch(monkeypatch):
+        """Run the fingerprint check with one differing fingerprint entry."""
+        import json
+
+        monkeypatch.setenv("NRL_CONTAINER", "1")
+        monkeypatch.delenv("NRL_FORCE_REBUILD_VENVS", raising=False)
+
+        container_fingerprint = {"uv.lock": "container-hash", "pyproject.toml": "same"}
+        current_fingerprint = {"uv.lock": "code-hash", "pyproject.toml": "same"}
+
+        def mock_run_path(path, run_name=None):
+            print(json.dumps(current_fingerprint))
+
+        mock_container_fp_file = mock.MagicMock()
+        mock_container_fp_file.exists.return_value = True
+        mock_container_fp_file.read_text.return_value = json.dumps(
+            container_fingerprint
+        )
+
+        def path_constructor(arg):
+            if "/opt/nemo_rl_container_fingerprint" in str(arg):
+                return mock_container_fp_file
+            m = mock.MagicMock()
+            m.exists.return_value = True
+            mock_fp_script = mock.MagicMock()
+            mock_fp_script.exists.return_value = True
+            m.__truediv__ = mock.MagicMock(return_value=mock_fp_script)
+            return m
+
+        with mock.patch("runpy.run_path", side_effect=mock_run_path):
+            with mock.patch("nemo_rl.Path") as mock_path:
+                mock_path.side_effect = path_constructor
+                _check_container_fingerprint()
+
+    def test_mismatch_warning_is_a_single_line_record(self, monkeypatch, caplog):
+        """A mismatch warns exactly once, on one line.
+
+        Ray prefixes every line of a log record with "(pid=..., ip=...)" and
+        every worker re-runs this check on import, so a multi-line record
+        floods the driver log.
+        """
+        monkeypatch.delenv("NRL_IGNORE_VERSION_MISMATCH", raising=False)
+
+        with caplog.at_level(logging.DEBUG):
+            self._run_check_with_mismatch(monkeypatch)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "\n" not in message
+        # The differing key is named so the warning is actionable on its own.
+        assert "uv.lock" in message
+        # The matching key is not, otherwise the line grows with the manifest.
+        assert "pyproject.toml" not in message
+
+    def test_mismatch_detail_is_logged_at_debug(self, monkeypatch, caplog):
+        """The per-key container/current hashes stay available at debug level."""
+        monkeypatch.delenv("NRL_IGNORE_VERSION_MISMATCH", raising=False)
+
+        with caplog.at_level(logging.DEBUG):
+            self._run_check_with_mismatch(monkeypatch)
+
+        detail = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("container-hash" in m and "code-hash" in m for m in detail)
+
+    def test_mismatch_is_silent_with_ignore_flag(self, monkeypatch, caplog):
+        """NRL_IGNORE_VERSION_MISMATCH suppresses the warning."""
+        monkeypatch.setenv("NRL_IGNORE_VERSION_MISMATCH", "1")
+
+        with caplog.at_level(logging.DEBUG):
+            self._run_check_with_mismatch(monkeypatch)
+
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
     @pytest.mark.skip(reason="Complex mocking - integration test more appropriate")
     def test_check_raises_on_mismatch_without_ignore_flag(self, monkeypatch, tmp_path):
