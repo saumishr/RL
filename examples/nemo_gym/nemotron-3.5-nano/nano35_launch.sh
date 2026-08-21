@@ -210,15 +210,35 @@ fi
 # container_formatter uses `${sif_dir}/...` paths. Unset for non-SWE recipes.
 SIF_DIR="${SIF_DIR:-}"
 
-if [[ ! -f "${CONFIG_PATH}" ]]; then
-  echo "ERROR: CONFIG_PATH does not exist: ${CONFIG_PATH}" >&2
+# RECIPES_DIR_HOST: host directory bind-mounted over the in-container Nano 3.5
+# recipe directory. Defaults to this repo's copy; override it to keep the
+# workload configs in a separate repo, such as a pipeline repo that pins this one
+# as a submodule. CONFIG_PATH stays container-relative either way, since that is
+# how it reaches the training command.
+RECIPES_DIR_HOST="${RECIPES_DIR_HOST:-${PROJECT_ROOT}/examples/nemo_gym/nemotron-3.5-nano}"
+if [[ ! -d "${RECIPES_DIR_HOST}" ]]; then
+  echo "ERROR: RECIPES_DIR_HOST does not exist: ${RECIPES_DIR_HOST}" >&2
+  exit 1
+fi
+
+# Host-side view of CONFIG_PATH, for the checks below and for provenance. A
+# config under the Nano recipe directory is looked up in RECIPES_DIR_HOST, which
+# may sit outside this repo; anything else resolves as given.
+if [[ "${CONFIG_PATH}" == examples/nemo_gym/nemotron-3.5-nano/* ]]; then
+  CONFIG_PATH_HOST="${RECIPES_DIR_HOST}/$(basename "${CONFIG_PATH}")"
+else
+  CONFIG_PATH_HOST="${CONFIG_PATH}"
+fi
+
+if [[ ! -f "${CONFIG_PATH_HOST}" ]]; then
+  echo "ERROR: CONFIG_PATH does not exist: ${CONFIG_PATH_HOST}" >&2
   exit 1
 fi
 
 # The SWE recipe interpolates `${sif_dir}/...` paths at runtime. The
 # exemplar config carries only a placeholder, so hard-require SIF_DIR whenever
 # the selected config actually uses it (mirrors the teacher-path guard).
-if grep -q '${sif_dir}' "${CONFIG_PATH}"; then
+if grep -q '${sif_dir}' "${CONFIG_PATH_HOST}"; then
   : "${SIF_DIR:?SIF_DIR is required for the SWE recipe (directory of apptainer .sif images)}"
 fi
 
@@ -620,10 +640,8 @@ if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
   _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
   echo "  Mount: configs → /opt/nemo-rl/examples/configs"
 fi
-if [[ -d "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano:/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
-  echo "  Mount: Nano 3.5 recipes → /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
-fi
+_append_mount "${RECIPES_DIR_HOST}:/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
+echo "  Mount: Nano 3.5 recipes → /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano  (from ${RECIPES_DIR_HOST})"
 if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
   _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
   echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
@@ -824,6 +842,8 @@ echo ""
   fi
   echo "container: ${CONTAINER}"
   echo "config: ${CONFIG_PATH}"
+  echo "config_host: ${CONFIG_PATH_HOST}"
+  echo "recipes_dir_host: ${RECIPES_DIR_HOST}"
   echo "command: ${TRAIN_CMD}"
 } > "${RUN_DIR}/provenance.txt"
 
