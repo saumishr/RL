@@ -15,10 +15,10 @@
 # blend are inherited unchanged through rlvr.yaml, so reward and loss curves
 # stay comparable against the in_order arms on the same blend.
 #
-# The sibling rlvr_sc_local_disagg.yaml is this arm with the judges served on
-# the allocation instead. Judge hosting is the only difference between them --
-# everything else comes from the same two fragments -- so a delta between the
-# two arms is a judge-hosting delta and nothing else.
+# To serve the judges on the allocation instead, drop nvcf_judges.yaml from the
+# defaults below and launch through nano35_launch.sh without HOSTED_JUDGES=1.
+# The local judge settings live in rlvr.yaml and are never touched here, so they
+# come back intact; that shape needs 86 nodes rather than 66.
 #
 # Ordering in `defaults` is load-bearing: parents merge left to right, and
 # readyfirst_cpu_rdma.yaml replaces async_rl rather than merging with it, so it

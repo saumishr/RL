@@ -1,11 +1,11 @@
 # =============================================================================
 # ready_first sampling at lag 1 + CPU RDMA rollouts — mergeable fragment
 # =============================================================================
-# The feature deltas both all-features arms carry, in one place so the arms
-# cannot drift apart. Judge hosting is the ONLY difference between them:
-#
-#   rlvr_sc_nvcf_disagg.yaml   judges on NVCF, 66 nodes
-#   rlvr_sc_local_disagg.yaml  judges served on the allocation, 86 nodes
+# The feature deltas that turn the SC dolphin recipe into the all-features arm.
+# Kept as a fragment rather than inlined into its one consumer today
+# (rlvr_sc_nvcf_disagg.yaml, 66 nodes) so this bundle composes onto rlvr_sc.yaml
+# independently of judge hosting -- swapping judges in or out is then a change to
+# a recipe's `defaults` list, not a re-edit of these values.
 #
 # List this AFTER rlvr_sc.yaml in a recipe's `defaults`. Ordering is
 # load-bearing: parents merge left to right, and the async_rl block below
