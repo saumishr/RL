@@ -106,15 +106,22 @@ async_rl:
 # Every key below is required by DataPlaneConfig, and rlvr.yaml carries no
 # data_plane block to inherit them from, so the whole schema is spelled out
 # here rather than overriding a base like the in-tree SC recipes do.
+#
+# Sizing lives under a block named for the backend that reads it, and only the
+# block named by `backend` is consulted. The flat spelling this recipe used to
+# carry is not rejected -- the keys are simply never read -- so it silently
+# dropped num_storage_units back to a default that does not exist, which is why
+# they are nested now.
 data_plane:
   enabled: true
   impl: transfer_queue
   backend: "simple"
-  storage_capacity: 1000000
-  num_storage_units: 16
   claim_meta_poll_interval_s: 0.5
-  # Read only when backend == "mooncake_cpu"; the simple backend ignores both.
-  # Carried at their 64-node dolphin values so switching backends needs no
-  # resizing pass.
-  global_segment_size: 549755813888  # 512 GiB
-  local_buffer_size: 68719476736     # 64 GiB
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: 16
+  # Read only when backend == "mooncake_cpu". Carried at their 64-node dolphin
+  # values so switching backends needs no resizing pass.
+  mooncake_cpu:
+    global_segment_size: 549755813888  # 512 GiB per client process
+    local_buffer_size: 68719476736     # 64 GiB per client process
