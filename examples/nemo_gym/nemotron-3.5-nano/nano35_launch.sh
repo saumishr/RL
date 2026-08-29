@@ -50,6 +50,14 @@ set -euo pipefail
 #   NUM_TRAIN_NODES=                        Training (Megatron) nodes
 #   NUM_GEN_NODES=                          Policy-generation nodes
 #   NUM_GYM_NODES=                          In-cluster NeMo Gym judge nodes
+#   HOSTED_JUDGES=0                        1 when every judge is served off the
+#                                          allocation (endpoints in the config);
+#                                          drops the judge checkpoint
+#                                          requirements and the GenRM hetgroup
+#   NO_COLOCATED_SANDBOX=0                 1 when ns_tools reaches sandboxes over
+#                                          the network instead of the per-node
+#                                          sidecar; makes SANDBOX_CONTAINER
+#                                          optional
 #   NUM_EXTERNAL_SERVICE_NODES=0            Nodes reserved outside training Ray
 #   GENRM_SEGMENT_SIZE=                      Segment size for the external
 #                                          service hetgroup
@@ -116,51 +124,72 @@ case "${RECIPE}" in
     NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-32}"
     NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
     NUM_GYM_NODES="${NUM_GYM_NODES:-6}"
-    NUM_EXTERNAL_SERVICE_NODES="${NUM_EXTERNAL_SERVICE_NODES:-16}"
     SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
 
-    : "${GENRM_MODEL:?GENRM_MODEL is required for the RLVR recipe}"
-    : "${GENRM_REASONING_PARSER:?GENRM_REASONING_PARSER is required for the RLVR recipe}"
-    : "${NL2BASH_JUDGE_MODEL:?NL2BASH_JUDGE_MODEL is required for the RLVR recipe}"
-    : "${SAFETY_JUDGE_MODEL:?SAFETY_JUDGE_MODEL is required for the RLVR recipe}"
+    # HOSTED_JUDGES=1 means GenRM, NL2Bash and the safety judge are all served
+    # off the allocation (NVCF, say) with their endpoints and model names in the
+    # config. There is then no local checkpoint to point at, no GenRM hetgroup
+    # to raise, and no judge override to emit: a `.model=` on the command line
+    # beats the config, so it would point a hosted judge back at a local path
+    # while the YAML still looked correct.
+    HOSTED_JUDGES="${HOSTED_JUDGES:-0}"
+    if [[ "${HOSTED_JUDGES}" == "1" ]]; then
+      NUM_EXTERNAL_SERVICE_NODES="${NUM_EXTERNAL_SERVICE_NODES:-0}"
+      if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+        echo "ERROR: HOSTED_JUDGES=1 serves every judge off the allocation, so NUM_EXTERNAL_SERVICE_NODES must be 0 (got ${NUM_EXTERNAL_SERVICE_NODES})." >&2
+        exit 1
+      fi
+      GENRM_BASE_URL=""
+      GENRM_MODEL=""
+      GENRM_API_MODEL_NAME=""
+      NL2BASH_JUDGE_MODEL=""
+      SAFETY_JUDGE_MODEL=""
+    else
+      NUM_EXTERNAL_SERVICE_NODES="${NUM_EXTERNAL_SERVICE_NODES:-16}"
 
-    GENRM_BASE_URL="__GENRM_BASE_URL__"
-    GENRM_REPLICAS="${GENRM_REPLICAS:-8}"
-    GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-8}"
-    GENRM_SERVED_MODEL_NAME="${GENRM_SERVED_MODEL_NAME:-model}"
-    GENRM_API_MODEL_NAME="${GENRM_API_MODEL_NAME:-${GENRM_SERVED_MODEL_NAME}}"
-    NUM_GENRM_NODES="${NUM_GENRM_NODES:-${NUM_EXTERNAL_SERVICE_NODES}}"
-    GENRM_VLLM_PORT="${GENRM_VLLM_PORT:-8000}"
-    GENRM_LB_PORT="${GENRM_LB_PORT:-9213}"
-    GENRM_STARTUP_TIMEOUT="${GENRM_STARTUP_TIMEOUT:-3600}"
-    GENRM_CONTAINER="${GENRM_CONTAINER:-${CONTAINER:-}}"
-    GENRM_VLLM_PYTHON="${GENRM_VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}"
-    GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-ultra_v3}"
-    GENRM_TOOL_CALL_PARSER="${GENRM_TOOL_CALL_PARSER:-qwen3_coder}"
-    GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
-    GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-{\"pass_config\":{\"fuse_allreduce_rms\":false}}}"
-    GENRM_MODEL_LOADER_EXTRA_CONFIG="${GENRM_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":96}}"
-    GENRM_TOOLS_DIR_HOST="${GENRM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_genrm}"
-    RAY_SUB="${RAY_SUB:-${PROJECT_ROOT}/ray.sub}"
-    BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_genrm/run_in_allocation.sh}"
-    export \
-      GENRM_COMPILATION_CONFIG \
-      GENRM_CONTAINER \
-      GENRM_ENABLE_EXPERT_PARALLEL \
-      GENRM_LB_PORT \
-      GENRM_MODEL \
-      GENRM_MODEL_LOADER_EXTRA_CONFIG \
-      GENRM_REASONING_PARSER \
-      GENRM_REASONING_PARSER_NAME \
-      GENRM_REPLICAS \
-      GENRM_SERVED_MODEL_NAME \
-      GENRM_STARTUP_TIMEOUT \
-      GENRM_TENSOR_PARALLEL_SIZE \
-      GENRM_TOOL_CALL_PARSER \
-      GENRM_TOOLS_DIR_HOST \
-      GENRM_VLLM_PORT \
-      GENRM_VLLM_PYTHON \
-      NUM_GENRM_NODES
+      : "${GENRM_MODEL:?GENRM_MODEL is required for the RLVR recipe}"
+      : "${GENRM_REASONING_PARSER:?GENRM_REASONING_PARSER is required for the RLVR recipe}"
+      : "${NL2BASH_JUDGE_MODEL:?NL2BASH_JUDGE_MODEL is required for the RLVR recipe}"
+      : "${SAFETY_JUDGE_MODEL:?SAFETY_JUDGE_MODEL is required for the RLVR recipe}"
+
+      GENRM_BASE_URL="__GENRM_BASE_URL__"
+      GENRM_REPLICAS="${GENRM_REPLICAS:-8}"
+      GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-8}"
+      GENRM_SERVED_MODEL_NAME="${GENRM_SERVED_MODEL_NAME:-model}"
+      GENRM_API_MODEL_NAME="${GENRM_API_MODEL_NAME:-${GENRM_SERVED_MODEL_NAME}}"
+      NUM_GENRM_NODES="${NUM_GENRM_NODES:-${NUM_EXTERNAL_SERVICE_NODES}}"
+      GENRM_VLLM_PORT="${GENRM_VLLM_PORT:-8000}"
+      GENRM_LB_PORT="${GENRM_LB_PORT:-9213}"
+      GENRM_STARTUP_TIMEOUT="${GENRM_STARTUP_TIMEOUT:-3600}"
+      GENRM_CONTAINER="${GENRM_CONTAINER:-${CONTAINER:-}}"
+      GENRM_VLLM_PYTHON="${GENRM_VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}"
+      GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-ultra_v3}"
+      GENRM_TOOL_CALL_PARSER="${GENRM_TOOL_CALL_PARSER:-qwen3_coder}"
+      GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
+      GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-{\"pass_config\":{\"fuse_allreduce_rms\":false}}}"
+      GENRM_MODEL_LOADER_EXTRA_CONFIG="${GENRM_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":96}}"
+      GENRM_TOOLS_DIR_HOST="${GENRM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_genrm}"
+      RAY_SUB="${RAY_SUB:-${PROJECT_ROOT}/ray.sub}"
+      BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_genrm/run_in_allocation.sh}"
+      export \
+        GENRM_COMPILATION_CONFIG \
+        GENRM_CONTAINER \
+        GENRM_ENABLE_EXPERT_PARALLEL \
+        GENRM_LB_PORT \
+        GENRM_MODEL \
+        GENRM_MODEL_LOADER_EXTRA_CONFIG \
+        GENRM_REASONING_PARSER \
+        GENRM_REASONING_PARSER_NAME \
+        GENRM_REPLICAS \
+        GENRM_SERVED_MODEL_NAME \
+        GENRM_STARTUP_TIMEOUT \
+        GENRM_TENSOR_PARALLEL_SIZE \
+        GENRM_TOOL_CALL_PARSER \
+        GENRM_TOOLS_DIR_HOST \
+        GENRM_VLLM_PORT \
+        GENRM_VLLM_PYTHON \
+        NUM_GENRM_NODES
+    fi
     ;;
   *)
     echo "ERROR: unknown recipe '${RECIPE}'; expected swe or rlvr." >&2
@@ -182,7 +211,17 @@ TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
 : "${TRAIN_PATH:?TRAIN_PATH is required (training data jsonl path)}"
 : "${VAL_PATH:?VAL_PATH is required (validation data jsonl path)}"
 : "${CONTAINER:?CONTAINER is required (NGC image URI or .sqsh path)}"
-: "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image)}"
+# NO_COLOCATED_SANDBOX=1 means ns_tools reaches sandboxes over the network -- an
+# OpenSandbox warm pool, say -- instead of the per-node sidecar. ray.sub already
+# skips sandbox startup on an empty SANDBOX_CONTAINER, so this only lifts the
+# requirement; it stays a requirement by default, because an unset image with a
+# colocated backend gives a run whose sandbox rewards silently all fail.
+NO_COLOCATED_SANDBOX="${NO_COLOCATED_SANDBOX:-0}"
+if [[ "${NO_COLOCATED_SANDBOX}" == "1" ]]; then
+  SANDBOX_CONTAINER=""
+else
+  : "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image); set NO_COLOCATED_SANDBOX=1 to run against a remote sandbox pool instead}"
+fi
 : "${PERSISTENT_CACHE:?PERSISTENT_CACHE is required (shared directory for vLLM/Triton/Inductor caches)}"
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
 : "${SLURM_ACCOUNT:?SLURM_ACCOUNT is required}"
@@ -798,7 +837,7 @@ echo "  Train data:  ${TRAIN_PATH}"
 echo "  Val data:    ${VAL_PATH}"
 echo "  Container:   ${CONTAINER}"
 echo "  Custom vLLM: ${USE_CUSTOM_VLLM}"
-echo "  Sandbox:     ${SANDBOX_CONTAINER}"
+echo "  Sandbox:     ${SANDBOX_CONTAINER:-<none: remote pool, NS_TOOLS_SANDBOX_TYPE=${NS_TOOLS_SANDBOX_TYPE:-unset}>}"
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
 echo "  Snapshot:    ${SNAPSHOT_DIR}"
 fi

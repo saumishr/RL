@@ -1,0 +1,54 @@
+# =============================================================================
+# NVCF-hosted judges — mergeable fragment
+# =============================================================================
+# Routes all three judge/reward models at NVCF instead of serving them on the
+# allocation. Translated from the overrides job 3278011 ran (the Ultra 3K
+# NVCF + disaggregated-sandbox arm), whose judge endpoints are the same three
+# NVCF functions this recipe needs.
+#
+# base_url is the ONLY switch. When it is truthy Gym skips the local vLLM launch
+# entirely, and every vllm_serve_kwargs / vllm_serve_env_vars setting on the
+# block below it becomes inert -- inherited, but never read. That is why the
+# local-judge settings stay in rlvr.yaml untouched: this fragment does not
+# delete them, it makes them unreachable.
+#
+# This file has NO `defaults` key on purpose. It is a fragment, so a recipe can
+# list it as a second parent without dragging rlvr.yaml in behind it and
+# clobbering the first parent's deltas.
+#
+# Three things that bite:
+#
+#  1. The nesting is asymmetric. GenRM's inner key repeats the outer name
+#     (genrm_model.responses_api_models.genrm_model); the other two use
+#     local_vllm_model. A wrong key silently creates an unused block instead of
+#     erroring -- the only symptom is that the run serves a local vLLM anyway.
+#  2. ${oc.env:NVIDIA_API_KEY} is written plainly, with no backslash. YAML is
+#     not shell-expanded, so the escaping a launcher needs when it passes the
+#     same thing as a Hydra override would land in the literal string here and
+#     break it. The caller must export NVIDIA_API_KEY; it reaches the
+#     in-container driver the way WANDB_API_KEY does.
+#  3. Shrink the allocation to match, or the freed nodes are wasted. This
+#     fragment cannot express that: with all three judges hosted, nothing on
+#     the GenRM hetgroup is serving them. rlvr_sc_nvcf_disagg.yaml's launcher
+#     sets NUM_EXTERNAL_SERVICE_NODES=0 for exactly this reason.
+# =============================================================================
+env:
+  nemo_gym:
+    genrm_model:
+      responses_api_models:
+        genrm_model:                    # note: nested key repeats the block name
+          base_url: ["https://integrate.api.nvidia.com/v1"]
+          api_key: ${oc.env:NVIDIA_API_KEY}
+          model: private/ultra-genrm/nvidia/nemotron3-ultra-genrm
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:               # note: NOT nl2bash_judge_model
+          base_url: ["https://integrate.api.nvidia.com/v1"]
+          api_key: ${oc.env:NVIDIA_API_KEY}
+          model: private/nemotron/qwen/qwen3-235b-a22b-instruct-2507
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          base_url: ["https://integrate.api.nvidia.com/v1"]
+          api_key: ${oc.env:NVIDIA_API_KEY}
+          model: private/nemotron/nvidia/nemotron-content-safety-reasoning-4b

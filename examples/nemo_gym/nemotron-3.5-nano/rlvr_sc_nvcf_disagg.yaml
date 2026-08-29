@@ -1,0 +1,134 @@
+# =============================================================================
+# Nemotron 3.5 Nano — Amplified Dolphin RLVR, all-features arm
+# =============================================================================
+# Everything the convergence campaign tested separately, in one config:
+#
+#   SingleController            inherited from rlvr_sc.yaml
+#   streaming forward/backward  inherited (min_groups_for_streaming_train)
+#   ready_first sampler, lag 1  set below, replacing in_order
+#   NVCF-hosted judges          nvcf_judges.yaml (second parent)
+#   disaggregated sandboxes     NOT a config concern -- see below
+#   CPU RDMA data plane         data_plane.backend=mooncake_cpu below
+#   nccl_reshard refit          inherited from rlvr_sc.yaml
+#
+# Model, parallelism, batch shape, sequence length, MTP settings and the Gym
+# blend are inherited unchanged through rlvr.yaml, so reward and loss curves
+# stay comparable against the in_order arms on the same blend.
+#
+# Both parents merge in order and touch disjoint keys: rlvr_sc.yaml carries the
+# SC deltas, nvcf_judges.yaml rewrites only judge base_url/api_key/model.
+# nvcf_judges.yaml declares no parent of its own, which is what makes that
+# ordering safe -- a fragment inheriting rlvr.yaml would re-apply base values
+# over the SC overlay.
+#
+# DISAGGREGATED SANDBOXES ARE NOT CONFIGURED HERE. At the pinned Gym commit,
+# resources_servers/ns_tools/configs/ns_tools.yaml reads the backend switch and
+# every pool setting straight from the environment
+# (NS_TOOLS_SANDBOX_TYPE, NS_SANDBOX_POOL_REF / _SIZE / _FALLBACK / _TTL_S,
+# NS_SANDBOX_IMAGE, OPENSANDBOX_BASE_URL / _API_KEY), and math_formal_lean does
+# the same with MATH_FORMAL_LEAN_BACKEND. Restating any of it here would create
+# a second place to keep in sync for no gain. launch_rlvr_sc_nvcf_disagg.sh
+# owns those variables; see its header for the pool contract.
+#
+# Entrypoint: examples/run_grpo_single_controller.py. Launch with
+# launch_rlvr_sc_nvcf_disagg.sh, which carries the 66-node split (no judge
+# hetgroup, because all three judges are hosted).
+# =============================================================================
+defaults:
+  - rlvr_sc.yaml
+  - nvcf_judges.yaml
+
+# =============================================================================
+# Loss — the importance ratio has to become real under ready_first
+# =============================================================================
+# validate_single_controller_config rejects ready_first unless
+# force_on_policy_ratio is false, and the reason is the sampler's whole point:
+# it fills a batch from whatever is ready across weight versions, so a batch is
+# a mixture of policies rather than in_order's single stamped target step.
+# Forcing r_t = 1.0 would then discard a real policy gap instead of a small one.
+#
+# Turning it off makes the inherited correction live for the first time:
+# use_importance_sampling_correction and truncated_importance_sampling_ratio=5
+# are inert under force_on_policy_ratio=true, because the ratio never varies.
+# So watch token_mult_prob_error and is_oob_ratio on this arm specifically --
+# they are measuring something here, and were measuring nothing on the arms
+# that force the ratio.
+#
+# This is the one confound this arm cannot remove by config: sampler is the
+# only *intended* variable against the in_order arms, but the loss ratio moves
+# with it.
+# =============================================================================
+loss_fn:
+  force_on_policy_ratio: false
+
+# =============================================================================
+# SingleController async RL — ready_first at a staleness window of 1
+# =============================================================================
+# _override_ rather than merging, and it is load-bearing even where the numbers
+# below match the parent: ready_first reads max_staleness_versions, not the
+# max_lookahead_versions in_order reads, and every sampler config is
+# extra="allow". A plain merge would leave the inherited max_lookahead_versions
+# sitting in a ready_first block where it means nothing. _override_ is only
+# honoured on a top-level key, so the whole async_rl block is restated rather
+# than just the sampler.
+#
+# What this arm isolates: both samplers gate admission identically, so at the
+# same lag generation runs at most one dispatch batch ahead either way. The
+# difference is selection. in_order drains one target step at a time and stamps
+# every cohort with the exact optimizer step that will train on it; ready_first
+# takes whatever is ready across weight versions, so a straggler that misses
+# its window is still trained on instead of being discarded -- which is what
+# makes it the arm to reach for when generation tail latency, not policy
+# freshness, is the problem.
+# =============================================================================
+async_rl:
+  _override_: true
+  sampler:
+    name: ready_first
+    max_staleness_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+
+  # Unchanged from the in_order arm: 512 / 32 = 16 streaming chunks per
+  # optimizer step, so streaming behaves the same and only selection differs.
+  min_groups_for_streaming_train: 32
+
+  # The current cohort plus its single admitted lookahead cohort. Admission
+  # stops generation at trainer_version + 1, so anything above 512 * 2 is
+  # unreachable. Also the hard floor: ready_first is a gated sampler and
+  # requires num_prompts_per_step * (staleness + 1) = 1024, below which the
+  # rollout pump deadlocks waiting for buffer slots.
+  max_inflight_prompts: 1024
+  max_buffered_rollouts: 1024
+
+  # Restated at the in_order arm's values.
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5
+    max_data_attempts_per_prompt: 2
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    max_consecutive_dropped_prompts: 32
+    max_skipped_prompts: 32
+    on_dropped_prompt: replace
+    max_replacement_attempts: 1
+    replacement_reserve_prompts: 1
+    min_step_batch_fraction: 0.9
+    nemo_gym:
+      # Judges are network round trips on this arm, not local vLLM, so a
+      # rollout's tail is bounded by NVCF latency rather than by GPU queueing.
+      rollout_timeout_s: 1800.0
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 2400.0
+    stall_action: warn
+    gym_subprocess_check: true
+
+# =============================================================================
+# TransferQueue data plane — rollouts over CPU RDMA
+# =============================================================================
+# mooncake_cpu carries rollouts over CPU RDMA and has no TCP fallback: it
+# raises at data-plane setup if no RDMA device is usable rather than degrading
+# silently. The simple backend's num_storage_units is inherited and unread on
+# this arm; set backend=simple to fall back to the SimpleStorage Ray actors.
+# =============================================================================
+data_plane:
+  backend: mooncake_cpu
