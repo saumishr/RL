@@ -87,17 +87,29 @@ async_rl:
   max_inflight_prompts: 1024
   max_buffered_rollouts: 1024
 
-  # Restated at the in_order arm's values.
+  # Retries are restated at the in_order arm's values, but the drop budget is NOT
+  # and cannot be. in_order is the only built-in sampler that stamps a target
+  # step, and only a stamped step can be credited short, so under ready_first a
+  # given-up prompt is never subtracted from the step waiting on it: that step
+  # waits for a group nobody is generating. validate_single_controller_config
+  # rejects the combination outright rather than letting it stall the run hours
+  # in, so a non-zero budget here does not fail at step 200 -- it fails at
+  # startup. on_dropped_prompt is 'shrink' for the same reason ('replace' fills a
+  # spare pool that only a stamped step ever draws from, so it is inert here).
+  #
+  # The tolerance this costs is narrower than it looks: the retry counts above
+  # are untouched, so transient infra and data failures are still retried up to
+  # 5 and 2 times. What changes is the endgame -- a prompt that exhausts its
+  # retries ends the run rather than being skipped. That is the intended posture
+  # for a convergence arm, where a silently shortened step is worse than a stop.
   rollout_failure:
     max_infra_attempts_per_prompt: 5
     max_data_attempts_per_prompt: 2
     backoff_base_s: 1.0
     max_backoff_s: 30.0
-    max_consecutive_dropped_prompts: 32
-    max_skipped_prompts: 32
-    on_dropped_prompt: replace
-    max_replacement_attempts: 1
-    replacement_reserve_prompts: 1
+    max_consecutive_dropped_prompts: 0
+    max_skipped_prompts: 0
+    on_dropped_prompt: shrink
     min_step_batch_fraction: 0.9
     nemo_gym:
       rollout_timeout_s: 1800.0
