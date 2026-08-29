@@ -65,6 +65,11 @@ set -euo pipefail
 #                                          ray.sub detect CPUTot from SLURM.
 #                                          Set only for a heterogeneous
 #                                          allocation
+#   UV_FROZEN=                             1 forwards --frozen to the driver's
+#                                          uv run, so a lock that disagrees
+#                                          with the tree is used as-is instead
+#                                          of triggering a re-lock. Required
+#                                          where compute has no package egress
 #   BATCH_SCRIPT=ray.sub                    Slurm entrypoint; external services
 #                                          may wrap ray.sub
 #   ENABLE_MTP_INFERENCE=0                 1 to enable MTP speculative decoding
@@ -659,22 +664,29 @@ _append_mount() {
   fi
 }
 
-if [[ -d "${OVERLAY_SOURCE}/nemo_rl" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl"
-  echo "  Mount: nemo_rl → /opt/nemo-rl/nemo_rl"
-fi
-if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
-  echo "  Mount: configs → /opt/nemo-rl/examples/configs"
-fi
-if [[ -d "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano:/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
-  echo "  Mount: Nano 3.5 recipes → /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
-fi
-if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-  echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-fi
+# Mount only what has content. An uninitialized submodule leaves an empty
+# directory behind, which `-d` alone accepts -- and bind-mounting it would
+# shadow the container's copy with nothing, surfacing as a missing-module or
+# missing-config error long after the allocation is up. Skipping it instead
+# falls back to the image, which is what a checkout without submodules wants.
+_mount_if_populated() {
+  local src="$1" dst="$2" label="$3"
+  if [[ ! -d "${src}" ]]; then
+    return
+  fi
+  if [[ -z "$(ls -A "${src}" 2>/dev/null)" ]]; then
+    echo "  WARNING: ${label} is empty at ${src}; using the container's copy instead." >&2
+    echo "           If this is a submodule, run: git submodule update --init" >&2
+    return
+  fi
+  _append_mount "${src}:${dst}"
+  echo "  Mount: ${label} → ${dst}"
+}
+
+_mount_if_populated "${OVERLAY_SOURCE}/nemo_rl" "/opt/nemo-rl/nemo_rl" "nemo_rl"
+_mount_if_populated "${OVERLAY_SOURCE}/examples/configs" "/opt/nemo-rl/examples/configs" "configs"
+_mount_if_populated "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano" "/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano" "Nano 3.5 recipes"
+_mount_if_populated "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" "/opt/nemo-rl/3rdparty/Gym-workspace/Gym" "Gym"
 
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
   _append_mount "${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
@@ -778,6 +790,7 @@ UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
+${UV_FROZEN:+UV_FROZEN=${UV_FROZEN} }\
 VLLM_USE_FLASHINFER_MOE_FP8=1 \
 VLLM_FLASHINFER_MOE_BACKEND=latency \
 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \

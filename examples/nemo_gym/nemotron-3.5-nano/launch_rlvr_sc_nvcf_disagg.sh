@@ -140,6 +140,19 @@ export MATH_FORMAL_LEAN_BACKEND="${MATH_FORMAL_LEAN_BACKEND:-ns_http}"
 export NEMO_GYM_RUN_ID="${NEMO_GYM_RUN_ID:-nano35-allfeatures-$(date +%m%d-%H%M%S)}"
 
 # -----------------------------------------------------------------------------
+# Driver dependency resolution
+# -----------------------------------------------------------------------------
+# UV_FROZEN=1 makes the driver's `uv run` use the committed lock rather than
+# re-locking when it disagrees with the tree. Two reasons, either sufficient:
+# this arm bumps the Gym submodule pin, which is exactly the kind of change that
+# invalidates the lock; and a re-lock fetches packages, which the CMH compute
+# nodes cannot do -- the driver then hangs for tens of minutes against a
+# blackholed CDN rather than failing. It also stops a 66-node job from quietly
+# resolving different dependencies than the run before it. This assumes the
+# image's baked venv already satisfies the tree, which is what prebaking is for.
+export UV_FROZEN="${UV_FROZEN:-1}"
+
+# -----------------------------------------------------------------------------
 # SingleController entrypoint and config
 # -----------------------------------------------------------------------------
 export CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/rlvr_sc_nvcf_disagg.yaml}"
