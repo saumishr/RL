@@ -31,6 +31,16 @@ ULTRA_CONFIG_PATHS = [
 ]
 NEMO_GYM_CONFIG_PATHS = ULTRA_CONFIG_PATHS + [
     "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml",
+    "examples/nemo_gym/nemotron-3.5-nano/rlvr.yaml",
+]
+# SingleController configs answer to a second contract on top of the GRPO one:
+# their own MasterConfig plus the cross-section checks in
+# validate_single_controller_config. Nothing else covers them, so a rename under
+# async_rl or a moved data_plane key surfaces as a failed launch rather than a
+# failed test.
+SINGLE_CONTROLLER_CONFIG_PATHS = [
+    "examples/nemo_gym/nemotron-3.5-nano/rlvr_sc.yaml",
+    "examples/nemo_gym/nemotron-3.5-nano/rlvr_sc_nvcf_disagg.yaml",
 ]
 
 
@@ -235,12 +245,8 @@ def test_add_resolver():
     assert config.value == 5
 
 
-@pytest.mark.parametrize("config_path", NEMO_GYM_CONFIG_PATHS)
-def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
-    """Ensure production NeMo Gym configs satisfy the current GRPO contract."""
-    from nemo_rl.algorithms.grpo import MasterConfig
-    from nemo_rl.utils.checkpoint import CheckpointManager
-
+def _resolve_recipe_config(config_path: str) -> dict:
+    """Load a production recipe config, standing in for what launchers supply."""
     register_omegaconf_resolvers()
     config = load_config(REPO_ROOT / config_path)
 
@@ -261,7 +267,16 @@ def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
     if "_teachers" in config and OmegaConf.is_missing(config["_teachers"], "general"):
         config["_teachers"]["general"] = "/tmp/test-teacher"
 
-    resolved = OmegaConf.to_container(config, resolve=True)
+    return OmegaConf.to_container(config, resolve=True)
+
+
+@pytest.mark.parametrize("config_path", NEMO_GYM_CONFIG_PATHS)
+def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
+    """Ensure production NeMo Gym configs satisfy the current GRPO contract."""
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.utils.checkpoint import CheckpointManager
+
+    resolved = _resolve_recipe_config(config_path)
 
     if config_path == "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml":
         assert resolved["grpo"]["val_num_generations_per_prompt"] == 2
@@ -271,6 +286,26 @@ def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
     # schema and the checkpointing block is accepted by CheckpointManager.
     master_config = MasterConfig.model_validate(resolved)
     CheckpointManager(master_config.checkpointing)
+
+
+@pytest.mark.parametrize("config_path", SINGLE_CONTROLLER_CONFIG_PATHS)
+def test_single_controller_configs_satisfy_current_contract(
+    config_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Ensure SingleController recipe configs pass the checks setup runs."""
+    from nemo_rl.algorithms.single_controller_utils.config import (
+        MasterConfig,
+        validate_single_controller_config,
+    )
+
+    # Hosted judges carry ${oc.env:NVIDIA_API_KEY}, resolved in the job rather
+    # than at submission, so resolution here needs a stand-in.
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+
+    resolved = _resolve_recipe_config(config_path)
+
+    master_config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(master_config)
 
 
 def test_parse_hydra_overrides():
