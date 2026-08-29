@@ -41,6 +41,7 @@ NEMO_GYM_CONFIG_PATHS = ULTRA_CONFIG_PATHS + [
 SINGLE_CONTROLLER_CONFIG_PATHS = [
     "examples/nemo_gym/nemotron-3.5-nano/rlvr_sc.yaml",
     "examples/nemo_gym/nemotron-3.5-nano/rlvr_sc_nvcf_disagg.yaml",
+    "examples/nemo_gym/nemotron-3.5-nano/rlvr_sc_local_disagg.yaml",
 ]
 
 

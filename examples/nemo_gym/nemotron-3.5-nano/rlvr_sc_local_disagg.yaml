@@ -1,0 +1,40 @@
+# =============================================================================
+# Nemotron 3.5 Nano — Amplified Dolphin RLVR, all-features arm, local judges
+# =============================================================================
+# The same feature set as rlvr_sc_nvcf_disagg.yaml with the judges served on
+# the allocation instead of on NVCF:
+#
+#   SingleController            rlvr_sc.yaml
+#   streaming forward/backward  rlvr_sc.yaml (min_groups_for_streaming_train)
+#   nccl_reshard refit          rlvr_sc.yaml
+#   ready_first sampler, lag 1  readyfirst_cpu_rdma.yaml
+#   CPU RDMA data plane         readyfirst_cpu_rdma.yaml (mooncake_cpu)
+#   local judges                rlvr.yaml, inherited untouched
+#   disaggregated sandboxes     environment-only; see readyfirst_cpu_rdma.yaml
+#
+# Judge hosting is the only difference from the NVCF arm: this config simply
+# omits nvcf_judges.yaml, so rlvr.yaml's judge blocks survive with their
+# base_url unset, which is what makes Gym launch the local vLLMs. Both arms
+# take the feature deltas from the same fragment, so they cannot drift.
+#
+# Why run this rather than the NVCF arm:
+#
+#   - Reward provenance. GenRM here is the checkpoint the convergence baseline
+#     scored against, so reward curves are comparable with it. The NVCF
+#     endpoint is a hosted model whose weights this repo cannot pin, so a
+#     reward delta there may be a judge delta rather than a training effect.
+#   - No shared-capacity risk. The NVCF GenRM function is shared, and its 504s
+#     under load are the documented abort criterion for that arm. Local judges
+#     cost 20 nodes and remove that failure mode entirely.
+#
+# Node cost: 86 rather than 66. The 20 extra nodes are the 16-node GenRM
+# hetgroup (8 replicas at TP=8) plus 4 of the 6 gym nodes, whose GPUs run the
+# NL2Bash judge (TP=4 x DP=4) and the safety judge (TP=4 x DP=2) as Gym-launched
+# local vLLMs. Launch with launch_rlvr_sc_local_disagg.sh, which carries that
+# split; the judge checkpoint paths are launcher arguments, as in rlvr.yaml.
+#
+# Entrypoint: examples/run_grpo_single_controller.py.
+# =============================================================================
+defaults:
+  - rlvr_sc.yaml
+  - readyfirst_cpu_rdma.yaml
