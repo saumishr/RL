@@ -351,7 +351,11 @@ MOUNTS="${MOUNTS:-}"
 # GB200 NVL72 defaults to 4 GPUs/node. Allow H100 smoke configs to request
 # their native 8-GPU node shape through the launch environment.
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
-export CPUS_PER_WORKER="${CPUS_PER_WORKER:-144}"
+# CPUS_PER_WORKER is deliberately unset: ray.sub reads the allocation's CPUTot
+# from SLURM and claims every core a node actually has. A default here silences
+# that detection everywhere, and over-claiming is not benign -- 144 cores asked
+# of a 140-core GB300 node leaves the worker sruns unschedulable, which presents
+# as a run whose steps never start. Set it only for a heterogeneous allocation.
 
 # =============================================================================
 # HuggingFace configuration
