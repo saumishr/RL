@@ -132,3 +132,33 @@ async_rl:
 # =============================================================================
 data_plane:
   backend: mooncake_cpu
+
+# =============================================================================
+# Checkpointing — off, and not by preference
+# =============================================================================
+# CPU RDMA and checkpointing are mutually exclusive on the SingleController
+# path today, so this arm has to give one up:
+#
+#   Every built-in sampler declares supports_buffer_checkpoint, so SC setup
+#   requires checkpointing.save_data_plane=true whenever checkpointing is
+#   enabled -- otherwise a resume would silently drop completed, unconsumed
+#   rollouts. Only the simple backend can write that snapshot
+#   (_CHECKPOINTABLE_BACKENDS), so mooncake_cpu with checkpointing enabled is
+#   refused outright rather than degraded.
+#
+# CPU RDMA is what this arm exists to exercise, so checkpointing loses. Be
+# aware of the cost: a crash restarts from step 0, there is no eval rung to
+# score, and the run is only practical over a short step budget. To trade back,
+# override at launch (no config edit needed):
+#
+#   data_plane.backend=simple checkpointing.enabled=true \
+#     checkpointing.save_data_plane=true
+#
+# save_data_plane must be cleared as well as enabled, not only for tidiness: SC
+# setup checks it against the backend BEFORE it checks whether checkpointing is
+# enabled at all, so inheriting true from rlvr_sc.yaml would fail this arm at
+# setup even with checkpointing off.
+# =============================================================================
+checkpointing:
+  enabled: false
+  save_data_plane: false

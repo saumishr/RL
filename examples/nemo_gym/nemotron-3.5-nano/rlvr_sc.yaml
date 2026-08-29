@@ -40,6 +40,13 @@ checkpointing:
   ft_save_period: 1
   ft_keep_latest_k: 1
   save_optimizer: true
+  # Required, not optional, on this path: every built-in sampler declares
+  # supports_buffer_checkpoint, and SC setup rejects checkpointing with a
+  # replay-capable sampler unless the checkpoint also carries the TQ snapshot
+  # and replay-buffer metadata. Without it a resume would silently discard
+  # completed, unconsumed rollouts. Only the simple data-plane backend can
+  # write it, which is why an arm on backend=mooncake_cpu cannot checkpoint.
+  save_data_plane: true
 
 # =============================================================================
 # GRPO
