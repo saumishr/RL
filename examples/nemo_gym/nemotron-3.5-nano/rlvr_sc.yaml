@@ -94,7 +94,7 @@ async_rl:
     min_step_batch_fraction: 0.9
     nemo_gym:
       rollout_timeout_s: 1800.0
-  watchdog:
+  stall_watchdog:
     interval_s: 30.0
     stall_timeout_s: 2400.0
     stall_action: warn

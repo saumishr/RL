@@ -293,6 +293,15 @@ policy:
   optimizer: null
   scheduler: null
 
+  # run_grpo_single_controller.py reads draft.enabled unconditionally, so the
+  # block must exist even though this study trains no draft head.
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
   # ---------------------------------------------------------------------------
   # Generation (vLLM) — Non-colocated, async
   # ---------------------------------------------------------------------------
@@ -304,6 +313,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
@@ -330,6 +342,9 @@ policy:
       reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
 
     vllm_kwargs:
+      # vLLM 0.25.1's auto-selected TRT-LLM MoE layout is incompatible with
+      # NeMo RL refit. Keep the refit-compatible backend used by Lightning.
+      moe_backend: flashinfer_cutlass
       attention_backend: FLASH_ATTN
       max_num_seqs: 64
       mamba_ssm_cache_dtype: "float32"
