@@ -1337,8 +1337,6 @@ class AsyncNemoGymRolloutImpl:
                         )
                     except Exception as error:
                         last_error = error
-                        if isinstance(error, ValueError):
-                            raise
                         # Only transport-shaped failures are worth another dispatch; a
                         # prompt NeMo-Gym cannot serve fails the same way every time.
                         if (
