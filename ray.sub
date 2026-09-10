@@ -156,6 +156,7 @@ fi
 # Port layout (all below ephemeral floor at 9000). Python port-range bounds
 # are half-open: [low, high).
 #   1200-1201    Ray GCS + client server (head only)
+#   1250         h2-ping-sidecar loopback listener (H2_PING_LISTEN)
 #   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
 #   1313-1399    Dynamo etcd/NATS control plane (driver-local allocation)
 #   1400-1999    Master address / TCPStore (cluster.master_port_range_low/high)
@@ -593,6 +594,30 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   mkdir -p "$SANDBOX_PORTS_DIR"
 fi
 
+# Signal directory for the optional h2-ping-sidecar (see H2_PING_SIDECAR below).
+# One sidecar runs per node because it listens on loopback and Ray does not pin
+# the NemoGym actor to any particular node -- job 3542717 failed exactly this
+# way, with the sidecar on the head node and the Gym servers elsewhere.
+# Bind it once, here, so every later reference is safe under `set -u` whether or
+# not the caller exported it. The head_cmd and worker_cmd heredocs below are
+# UNQUOTED (`<<EOF`), so bash expands their bodies on the submit host while the
+# string is being built -- which means an `if [[ -n "${H2_PING_SIDECAR:-}" ]]`
+# written INSIDE a heredoc guards nothing. It is just text at that point; the
+# expansion has already happened.
+#
+# Jobs 3652826 (66 nodes) and 3652884 (8 nodes) both died here at +1s, before Ray
+# started, on `H2_PING_SIDECAR: unbound variable`. The variable had been exported
+# for as long as the HTTP/2 sidecar arm ran; when that arm was retired in favour
+# of the CRLF heartbeat (Gym PR #3117) the export went away and two unguarded
+# references became fatal. Turning the sidecar OFF by unsetting the variable is
+# not the same as setting it off -- this script needs it defined either way.
+H2_PING_SIDECAR="${H2_PING_SIDECAR:-}"
+H2_PING_DIR=""
+if [[ -n "${H2_PING_SIDECAR}" ]]; then
+  H2_PING_DIR="$LOG_DIR/h2ping"
+  mkdir -p "$H2_PING_DIR"
+fi
+
 # First we start the head of the ray cluster on one of the physical nodes
 # Give the head node actual resources to make it schedulable
 
@@ -614,6 +639,25 @@ if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
   echo "[ERROR] $LOG_DIR/.shared_fs_canary not visible on the head node; LOG_DIR must be on a shared filesystem." >&2
   touch "$LOG_DIR/ENDED" 2>/dev/null || true
   exit 1
+fi
+
+# Optional HTTP/2 PING proxy for NVCF-hosted judges. NVCF sits behind AWS Global
+# Accelerator, which drops any connection carrying no application-layer data for
+# 340s. TCP keepalive does not reset that timer -- only bytes above TCP count --
+# and aiohttp has no HTTP/2 support, so it cannot send the PING frames that do.
+# One per node: it listens on loopback and Ray may place Gym servers anywhere.
+if [[ -n "${H2_PING_SIDECAR:-}" ]]; then
+  # 1250 lives in the undocumented 1202-1300 gap of the port map above. Do NOT
+  # use 8080: it falls inside the 7000-8999 vLLM rendezvous band, and that
+  # collision is how job 3542407 handed judge traffic to vLLM.
+  "${H2_PING_SIDECAR:-}" \\
+    -listen "${H2_PING_LISTEN:-127.0.0.1:1250}" \\
+    -upstream "${H2_PING_UPSTREAM:-https://integrate.api.nvidia.com}" \\
+    -ping-interval "${H2_PING_INTERVAL:-60s}" \\
+    -ready-file "$H2_PING_DIR/H2_READY_\$(hostname)" \\
+    > "$H2_PING_DIR/sidecar-\$(hostname).log" 2>&1 &
+  H2_PID=\$!
+  trap 'kill -TERM \$H2_PID 2>/dev/null || true' EXIT
 fi
 
 # Phase markers inside the container; reuse the propagated job-start epoch so the
@@ -819,6 +863,30 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   # and training process can measure post-ready initialization timing.
   export NRL_RAY_READY_EPOCH=\$(date +%s.%N)
 
+  # Gate the driver on every node's h2-ping-sidecar. Each node runs its own
+  # (started in the preamble) because the proxy listens on loopback and Ray does
+  # not pin the NemoGym actor to the head; job 3542717 died precisely here, with
+  # the sidecar on the head node and the Gym servers on another. Gym resolves
+  # base_url at startup and aborts if an endpoint never answers.
+  if [[ -n "$H2_PING_DIR" ]]; then
+    h2_ready=0
+    H2_DEADLINE=\$((SECONDS + 300))
+    while (( SECONDS < H2_DEADLINE )); do
+      h2_count=\$(ls -1 "$H2_PING_DIR"/H2_READY_* 2>/dev/null | wc -l)
+      if [[ "\$h2_count" -ge "$SLURM_JOB_NUM_NODES" ]]; then
+        echo "[INFO] h2-ping-sidecar ready on all $SLURM_JOB_NUM_NODES nodes"
+        h2_ready=1; break
+      fi
+      echo "[INFO] h2-ping-sidecar ready on \$h2_count/$SLURM_JOB_NUM_NODES nodes..."
+      sleep 5
+    done
+    if [[ "\$h2_ready" -eq 0 ]]; then
+      echo "[ERROR] h2-ping-sidecar not ready on all nodes (\$h2_count/$SLURM_JOB_NUM_NODES); judge traffic would hit a dead port" >&2
+      tail -n 20 "$H2_PING_DIR"/*.log >&2 2>/dev/null || true
+      touch "$LOG_DIR/ENDED"; exit 1
+    fi
+  fi
+
   log_phase "head: cluster ready, launching driver"
   set +e
   bash "$DRIVER_COMMAND_FILE" > "$LOG_DIR/ray-driver.log" 2>&1
@@ -847,6 +915,18 @@ echo "[INFO] Worker \$SLURM_PROCID on node \$SLURMD_NODENAME"
 if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
   echo "[ERROR] Worker \$SLURM_PROCID: $LOG_DIR/.shared_fs_canary not visible; LOG_DIR must be on a shared filesystem." >&2
   exit 1
+fi
+
+# See the head script for why this exists. One sidecar per node, on loopback.
+if [[ -n "${H2_PING_SIDECAR:-}" ]]; then
+  "${H2_PING_SIDECAR:-}" \\
+    -listen "${H2_PING_LISTEN:-127.0.0.1:1250}" \\
+    -upstream "${H2_PING_UPSTREAM:-https://integrate.api.nvidia.com}" \\
+    -ping-interval "${H2_PING_INTERVAL:-60s}" \\
+    -ready-file "$H2_PING_DIR/H2_READY_\$(hostname)" \\
+    > "$H2_PING_DIR/sidecar-\$(hostname).log" 2>&1 &
+  H2_PID=\$!
+  trap 'kill -TERM \$H2_PID 2>/dev/null || true' EXIT
 fi
 
 # Phase markers inside the container (see head container).

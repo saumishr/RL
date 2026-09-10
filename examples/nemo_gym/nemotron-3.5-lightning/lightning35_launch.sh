@@ -686,7 +686,10 @@ export RAY_SUB
 # then seed fresh from Lustre.
 # =============================================================================
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
-command -v zstd >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zstd; } 2>/dev/null || true
+# Timeouts, not just error suppression: on a node with no outbound egress
+# apt-get hangs rather than failing, and a single hung node stalls the whole
+# job because its raylet never starts. zstd only accelerates cache seeding.
+command -v zstd >/dev/null 2>&1 || { timeout 60 apt-get update -qq && timeout 120 apt-get install -y -qq zstd; } 2>/dev/null || true
 
 echo "[VLLM PATCH] Pre-applying NeMo RL patches to the generation-worker environment..."
 NRL_VLLM_PY=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python

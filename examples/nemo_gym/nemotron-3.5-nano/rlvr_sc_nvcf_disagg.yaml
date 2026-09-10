@@ -34,3 +34,8 @@ defaults:
   - rlvr_sc.yaml
   - nvcf_judges.yaml
   - readyfirst_cpu_rdma.yaml
+  # gym_fanout_lag4.yaml is deliberately NOT inherited here either. Job 3657252
+  # was submitted before that file existed and is the reference this comparison
+  # is anchored to, so inheriting it would make a relaunched NVCF arm differ
+  # from the very run it is meant to reproduce. Both arms therefore take lag,
+  # in-flight depth and timeouts from readyfirst_cpu_rdma.yaml unchanged.

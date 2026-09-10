@@ -1,0 +1,225 @@
+# =============================================================================
+# Gym uvicorn fan-out + lag 4 — shared verbatim by BOTH judge-hosting arms
+# =============================================================================
+# Both the NVCF arm (rlvr_sc_nvcf_disagg.yaml) and the Slurm-judge control arm
+# (rlvr_sc_slurm_judges.yaml) inherit this file, so none of it is a variable
+# between them: the only thing that differs across arms stays WHERE the judges
+# are hosted.
+#
+# WHY. Job 3656607 closed step 0 in 13 min and then paced step 1 at 32-minute
+# rollout cohorts. Measured at the time:
+#
+#   GenRM throughput   1.26 req/s -> 0.087 req/s   (14x drop)
+#   GenRM latency      294s mean  -> 130s mean     (FELL)
+#   GenRM concurrency  ~370       -> ~11
+#   all 6 replicas UP, every response 200, zero 4xx/5xx
+#
+# Latency FALLING while throughput collapsed means the judge tier was starved,
+# not overloaded -- it sat at ~6% of its admission capacity (~62 concurrent
+# against max_num_seqs=1024). So adding judge replicas or raising max_num_seqs
+# would have bought nothing; the constraint was upstream.
+#
+# The starvation source was Gym itself. All 71 servers ran on one node with
+# num_workers unset, which server_utils.py's get_nemo_gym_fastapi_num_workers
+# reads as "1", so every server answered its whole share of the fan-in from a
+# single event loop. Gym also stopped answering its 30s health check once step
+# 1 was under way, which is that same saturation seen from the outside. This is
+# the identical funnel the gym-scaling campaign hit at 86 nodes, where 32
+# policy engines ran 0-8 of 64 slots at 0-1.8% KV.
+#
+# SCOPE, and what is deliberately NOT here. The gym-scaling campaign fixed this
+# with two independent knobs: uvicorn fan-out (below) and a judge/verifier
+# SHARD PLAN with replicated verifier stacks. Only the first is portable to
+# this branch -- sharding is implemented in nemo_rl/environments/nemo_gym_shards.py,
+# which does not exist here, and the config keys for it (shards,
+# inherited_overlays, allowed_duplicate_entries) would be silently swallowed by
+# extra="allow" rather than rejected. A shard block here would therefore look
+# applied and do nothing, and because a shard plan also requires
+# `config_paths: null` to retract the flat list, it would take the entire
+# server blend down with it. Fan-out on the flat stack is the whole change.
+#
+# Expect this to move the ceiling rather than remove it: the flat stack still
+# carries 100% of the blend on one node's cores, where the sharded design
+# spread ~86% of it over 32 replicas.
+# =============================================================================
+
+env:
+  nemo_gym:
+    # =========================================================================
+    # Fan-out — per server, because there is no global knob
+    # =========================================================================
+    # num_workers lives on BaseServerConfig, so it is set per entry. Every
+    # value below requires the server's module to expose an importable `app`:
+    # with num_workers > 1 uvicorn imports the module in each worker instead of
+    # executing __main__, so an unguarded server's extra workers have nothing
+    # to serve. deepswe and vllm_model already carried that branch; simple_agent
+    # (Gym 958f50fc) and the four judge servers (Gym c2ca52f6) were given it
+    # for this run. NOTHING ELSE IS FANNED OUT HERE, and the omissions are all
+    # deliberate -- see the end of this block.
+    #
+    # Sizes are proportional to measured blend share rather than uniform.
+    # Counting agent_ref.name over the training blend: lc_judge 6.05%,
+    # ns_tools 3.10, equivalence_llm_judge 2.94, math_with_judge 2.49,
+    # jailbreak_detection 1.36, multichallenge 0.98, with the GenRM-graded
+    # remainder the large majority. Uniform fan-out would spend processes on
+    # servers that see a handful of requests. Total added processes: 76, against
+    # ~140 cores on the Gym node.
+    #
+    # Rollouts enter at the AGENT server, not the resources server:
+    # rollout_collection._post_subroutine posts /run to
+    # row["agent_ref"]["name"], and that server holds the rollout for its whole
+    # life, making the model calls and the verification call. Single-process
+    # agents are therefore the tightest funnel, which is why the agents get the
+    # larger shares.
+
+    # The GenRM path, and the reason this file exists: genrm_simple_agent is
+    # the agent holding every GenRM-graded rollout, and it was one process.
+    genrm_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          num_workers: 16
+    genrm_simple_agent_reasoning_off:
+      responses_api_agents:
+        simple_agent:
+          num_workers: 4
+
+    # Every model call from every rollout goes through this proxy, so it gets
+    # the largest share. Safe to fork because vllm_model is a pure proxy:
+    # base_url in, HTTP out, no engine of its own.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 16
+    # Inherits policy_model through _copy, so it is spelled out to keep it
+    # small rather than silently picking up 16.
+    policy_model_reasoning_off:
+      responses_api_models:
+        vllm_model:
+          num_workers: 4
+
+    lc_judge_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          num_workers: 8
+    equivalence_llm_judge_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          num_workers: 4
+    math_with_judge_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          num_workers: 4
+    jailbreak_detection_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          num_workers: 2
+    multichallenge_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          num_workers: 2
+
+    # The graders behind those agents. lc_judge and equivalence_llm_judge are
+    # two entries over the same equivalence_llm_judge server class, so both
+    # carry 4.
+    lc_judge:
+      resources_servers:
+        equivalence_llm_judge:
+          num_workers: 4
+    equivalence_llm_judge:
+      resources_servers:
+        equivalence_llm_judge:
+          num_workers: 4
+    # math_with_judge spawns a short-lived multiprocessing.Process per
+    # math-verify call rather than holding a fixed pool, so total subprocesses
+    # track concurrent requests and do not multiply with worker count. Nothing
+    # to divide here.
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          num_workers: 4
+    jailbreak_detection:
+      resources_servers:
+        jailbreak_detection:
+          num_workers: 2
+    multichallenge:
+      resources_servers:
+        multichallenge:
+          num_workers: 2
+
+    # NOT FANNED OUT, on purpose:
+    #
+    #   genrm_compare_resources_server — holds the cohort buffer that collects
+    #     one response per rollout slot before scoring the group, and that
+    #     state is process-local (_CohortState, keyed by group id + attempt).
+    #     Forking it would scatter a cohort's members across workers and no
+    #     worker would ever see a complete group. Unguarded on the gym-scaling
+    #     branch too, for this reason. It is a plausible remaining ceiling on
+    #     the GenRM path, but it is an asyncio loop doing HTTP, so one process
+    #     can hold a large number of concurrent calls -- worth instrumenting
+    #     before assuming it is the next bottleneck.
+    #
+    #   ns_tools — owns a SandboxPool warmed at server boot. Forking it would
+    #     multiply the pool by the worker count against a shared control plane.
+    #     Also unguarded.
+    #
+    #   nl2bash_judge_model / safety_judge_model — local_vllm_model, which owns
+    #     its engine. Its own config carries "TODO @bxyu-nvidia: Multiple
+    #     workers currently doesn't work" with num_workers commented out.
+    #     Forking these forks their engines.
+
+    # The inherited 4096 is not a considered value -- it is 16x below the
+    # 65,536 nemo_gym.py itself reaches for. RL sets these with setdefault, so
+    # an explicit 4096 in the base silently wins over that default and caps
+    # every actor's client pool, which would cancel out the fan-out above.
+    # server_utils.py divides both by num_workers, so the aggregate is what is
+    # written here.
+    global_aiohttp_connector_limit: 65536
+    global_aiohttp_connector_limit_per_host: 16384
+
+# =============================================================================
+# Lag 1 -> 4
+# =============================================================================
+# ready_first earns its keep by harvesting the fastest N groups out of a LARGE
+# in-flight pool. At lag 1 the pool was 1,024 against a 512-group step -- a 2:1
+# ratio, at which it must take nearly everything in flight and degenerates
+# toward in_order, paying the full long tail of the generation-length
+# distribution. At lag 4 the ratio is 5:1.
+#
+# max_inflight_prompts is not free-floating: for a gated sampler it is
+# num_prompts_per_step * (max_staleness_versions + 1) = 512 * 5 = 2,560, which
+# is also its hard floor. At 16 generations that is 40,960 concurrent rollout
+# rows, up from 16,384.
+async_rl:
+  sampler:
+    max_staleness_versions: 4
+  max_inflight_prompts: 2560
+  max_buffered_rollouts: 2560
+
+  # Three timeouts stay strictly ordered, and MasterConfig enforces the second
+  # inequality with a validator -- getting it wrong fails at config parse,
+  # which is how job 3567869 died in 5m17s:
+  #
+  #   NVCF poll budget 1900s  <  rollout_timeout_s 5400s  <  stall_timeout_s 6000s
+  #
+  # 1900 is NeMoGymAsyncOpenAI.nvcf_poll_timeout_seconds, just past NVCF's own
+  # 30-minute expiry so the terminal answer comes from the service rather than
+  # from us abandoning it early. rollout_timeout_s must clear that budget: the
+  # base recipe's 1800s fires BEFORE the poll finishes, recording every slow
+  # judgement as an abandoned rollout.
+  #
+  # Raised from 2400/3000 for lag 4. More concurrency on fixed compute buys
+  # latency, not throughput, once saturated (Little's Law), and cohorts already
+  # ran ~1,900s at lag 1 -- so a 2.5x larger in-flight pool will not make
+  # individual rollouts faster. Under ready_first max_skipped_prompts is pinned
+  # at 0, so a rollout that exhausts its retries ends the RUN rather than
+  # dropping a prompt: these two values are what stand between a slow cohort
+  # and a dead job.
+  #
+  # stall_timeout_s must clear rollout_timeout_s STRICTLY -- the validator
+  # rejects >= outright, and stall_action: warn does not make an equal value
+  # harmless.
+  rollout_failure:
+    nemo_gym:
+      rollout_timeout_s: 5400.0
+  stall_watchdog:
+    stall_timeout_s: 6000.0

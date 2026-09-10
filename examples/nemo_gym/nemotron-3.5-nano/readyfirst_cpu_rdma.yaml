@@ -99,12 +99,38 @@ async_rl:
   #
   # The tolerance this costs is narrower than it looks: the retry counts above
   # are untouched, so transient infra and data failures are still retried up to
-  # 5 and 2 times. What changes is the endgame -- a prompt that exhausts its
+  # 5 and 5 times. What changes is the endgame -- a prompt that exhausts its
   # retries ends the run rather than being skipped. That is the intended posture
   # for a convergence arm, where a silently shortened step is worse than a stop.
+  #
+  # RETRIES ARE THE ONLY TOLERANCE KNOB LEFT ON THIS ARM, which is why the data
+  # budget is 5 rather than the 2 every earlier run carried. With the drop budget
+  # pinned at 0 by the sampler, exhausting a budget is not a degraded step, it is
+  # the end of the run: the first prompt to run out propagates its failure
+  # through _dispatch_one_prompt's TaskGroup and kills the driver.
+  #
+  # Job 3654262 (66 nodes, NVCF judges) died that way 18 minutes in, before
+  # finishing step 1, on ONE prompt out of ~8,000:
+  #   RolloutDataFailure: NeMo-Gym /run failed with HTTP 400: 400,
+  #   message='Bad Request', url='http://10.67.22.148:5780/run'
+  # HTTP 400 is neither 5xx nor in _RETRIABLE_HTTP_STATUSES, so
+  # http_status_is_infra calls it DATA -- two attempts, then the run is over. The
+  # 0.9 min_step_batch_fraction never applied, because the prompt was never
+  # allowed to become a drop.
+  #
+  # 5 is a guess at the shape of that failure, not a diagnosis. The 400 arrived
+  # with an empty body and no Gym-side log, meaning the HTTP parser rejected the
+  # request before it reached the app, and nothing identifies the prompt. If the
+  # cause is transport-level corruption under socket pressure (the same run
+  # logged 21,300 ClientOSError retries against the policy servers) then more
+  # attempts clear it. If instead one dataset row deterministically serialises to
+  # a request the parser will not take -- and failing 2 for 2 while ~8,000 others
+  # passed leans that way -- then 5 only buys three more identical 400s. Hence
+  # the instrumentation added alongside this in nemo_rl/environments/nemo_gym.py:
+  # the next occurrence has to say which prompt and what the server sent back.
   rollout_failure:
     max_infra_attempts_per_prompt: 5
-    max_data_attempts_per_prompt: 2
+    max_data_attempts_per_prompt: 5
     backoff_base_s: 1.0
     max_backoff_s: 30.0
     max_consecutive_dropped_prompts: 0
@@ -126,9 +152,28 @@ async_rl:
 # raises at data-plane setup if no RDMA device is usable rather than degrading
 # silently. The simple backend's num_storage_units is inherited and unread on
 # these arms; set backend=simple to fall back to the SimpleStorage Ray actors.
+#
+# The sizes below MUST be set explicitly, because the upstream defaults (512 GiB
+# segment + 64 GiB local buffer) are per POLICY WORKER RANK, not per node. With
+# 4 ranks per GB300 node that asks for 4 x 576 GiB = 2304 GiB against 900 GiB of
+# RealMemory, so slurmstepd OOM-kills the ranks mid data-plane init: job 3407804
+# died with "Detected 26 oom_kill events" right after the first rank logged
+# "Mounting segment: 549755813888 bytes".
+#
+# 64 GiB + 8 GiB per rank is 288 GiB per node, a third of RAM, leaving room for
+# the Megatron host-side allocations. It is also far more store than the traffic
+# needs: max_buffered_rollouts is 1024 and a 73728-token rollout is single-digit
+# MB, so a few GB per rank would do. Sized generously because the cost of being
+# slightly large is nothing and the cost of being too small is a stall.
+#
+# If you change cluster.gpus_per_node or move to nodes with different RAM,
+# recompute this: the constraint is ranks_per_node x (segment + buffer) < RAM.
 # =============================================================================
 data_plane:
   backend: mooncake_cpu
+  mooncake_cpu:
+    global_segment_size: 68719476736 # 64 GiB per rank
+    local_buffer_size: 8589934592 # 8 GiB per rank
 
 # =============================================================================
 # Checkpointing — off, and not by preference

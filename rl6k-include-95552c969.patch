@@ -1,0 +1,396 @@
+--- a/nemo_rl/experience/interfaces.py
++++ b/nemo_rl/experience/interfaces.py
+@@ -18,14 +18,8 @@
+ from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
+ 
+ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
+-NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+-# Gym derives a model-call capture id from the task/rollout pair on a /run body
+-# ("<task>-<rollout>", plus "-a<n>" for a re-dispatch), and captures nothing for a
+-# row that carries neither. Stamped on every dispatched row so a run can be traced
+-# by flipping Gym's observability flag, with no data-path difference between a
+-# traced run and an untraced one.
+ NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+-NEMO_GYM_ATTEMPT_INDEX_KEY = "_ng_attempt_index"
++NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+ 
+ 
+ @dataclass
+--- a/nemo_rl/experience/rollout_manager.py
++++ b/nemo_rl/experience/rollout_manager.py
+@@ -16,6 +16,7 @@
+ import copy
+ import enum
+ import json
++import uuid
+ from dataclasses import dataclass, field
+ from typing import Any, Optional
+ 
+@@ -39,7 +40,6 @@
+     classify_rollout_failure,
+ )
+ from nemo_rl.experience.interfaces import (
+-    NEMO_GYM_ATTEMPT_INDEX_KEY,
+     NEMO_GYM_ROLLOUT_INDEX_KEY,
+     NEMO_GYM_TASK_INDEX_KEY,
+     Completion,
+@@ -62,6 +62,7 @@
+ from nemo_rl.utils.timer import Timer
+ 
+ TokenizerType = PreTrainedTokenizerBase
++_NEMO_GYM_TASK_INDEX_MASK = (1 << 63) - 1
+ 
+ 
+ class RolloutOutcome(str, enum.Enum):
+@@ -380,15 +381,23 @@
+         self._policy_generation = policy_generation
+         self._timeouts = timeouts
+ 
+-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
++    async def run_rollout(
++        self,
++        input_sample: DatumSpec,
++        *,
++        rollout_group_id: Optional[str] = None,
++    ) -> PromptGroupRecord:
+         """Run num_generations_per_prompt rollouts for one prompt.
+ 
+         Args:
+             input_sample: A single prompt (one DatumSpec entry).
++            rollout_group_id: Opaque identity for this rollout attempt. The native
++                rollout path does not use it.
+ 
+         Returns:
+             PromptGroupRecord with num_generations_per_prompt completions.
+         """
++        del rollout_group_id
+         timer = Timer()
+         timer_prefix = "timing/rollout"
+         timer.start(f"{timer_prefix}/total")
+@@ -774,11 +783,19 @@
+ 
+         self._validate_init_params()
+ 
+-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
++    async def run_rollout(
++        self,
++        input_sample: DatumSpec,
++        *,
++        rollout_group_id: Optional[str] = None,
++    ) -> PromptGroupRecord:
+         """Run num_generations_per_prompt rollouts for one prompt.
+ 
+         Args:
+             input_sample: A single prompt (one DatumSpec entry).
++            rollout_group_id: UUID identifying this rollout attempt. All generated
++                rows share it as their NeMo-Gym task identity. Direct callers that
++                do not reserve through TransferQueue receive a fresh UUID here.
+ 
+         Returns:
+             PromptGroupRecord with num_generations_per_prompt completions.
+@@ -787,7 +804,11 @@
+         timer_prefix = "timing/rollout"
+         timer.start(f"{timer_prefix}/total")
+ 
+-        rollout_inputs = self._build_inputs(input_sample)
++        if rollout_group_id is None:
++            rollout_group_id = str(uuid.uuid4())
++        rollout_inputs = self._build_inputs(
++            input_sample, rollout_group_id=rollout_group_id
++        )
+         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
+             rollout_inputs, timer, timer_prefix
+         )
+@@ -822,11 +843,35 @@
+             "Please set `max_rollout_turns` to 1."
+         )
+ 
+-    def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
+-        """Build N row dicts from input_sample, applying generation config params."""
++    def _build_inputs(
++        self, input_sample: DatumSpec, *, rollout_group_id: str
++    ) -> list[dict]:
++        """Build and identify N NeMo-Gym rows for one rollout attempt."""
++        try:
++            group_uuid_int = uuid.UUID(rollout_group_id).int
++        except (AttributeError, ValueError) as error:
++            raise ValueError(
++                f"rollout_group_id must be a valid UUID, got {rollout_group_id!r}"
++            ) from error
++
++        # Gym models this field as an integer and serializes requests with
++        # orjson, which rejects integers outside the 64-bit range. Fold both
++        # UUID halves into a non-negative signed-int64 value rather than sending
++        # the raw 128-bit UUID integer.
++        task_index = (
++            group_uuid_int ^ (group_uuid_int >> 64)
++        ) & _NEMO_GYM_TASK_INDEX_MASK
++
+         # Build a template row from the input_sample's extra_env_info, applying generation params.
+         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
+ 
++        # NeMo-Gym groups cohort rewards by _ng_task_index. Dataset-provided
++        # indices may be absent or repeat across epochs, and a failed attempt
++        # may still have requests alive inside Gym. The TQ reservation UUID is
++        # already unique per attempt, so use it to isolate this cohort without
++        # changing the source DatumSpec retained in PromptGroupRecord.
++        template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
++
+         # We do not translate max_seq_len into row-level max_tokens here because that would
+         # change semantics from "total sequence length" to "max new tokens".
+         responses_create_params = template_row["responses_create_params"]
+@@ -843,16 +888,11 @@
+         )
+ 
+         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
+-        # The rowidx doubles as the rollout half of Gym's model-call capture id; the
+-        # prompt's dataset index is the task half, so a capture file names the row it
+-        # came from. setdefault because an upstream collector may already have stamped
+-        # its own monotonic task index.
+         rows = []
+         for i in range(self._num_generations_per_prompt):
+             row = copy.deepcopy(template_row)
+             row["_rowidx"] = i
+             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
+-            row.setdefault(NEMO_GYM_TASK_INDEX_KEY, input_sample["idx"])
+             rows.append(row)
+         return rows
+ 
+@@ -961,10 +1001,6 @@
+                             f"row(s) (attempt {attempt}/{self._max_gym_row_attempts})",
+                             flush=True,
+                         )
+-                        # Keep this attempt's captured model calls separate from the
+-                        # prior attempt's, which are already on disk under the bare id.
+-                        for row in pending:
+-                            row[NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt - 1
+                         # Row re-dispatches are invisible in redispatch_total -- they
+                         # recover a partial group instead of retrying the prompt -- so
+                         # gym could retry rows all run with every counter flat.
+@@ -1208,8 +1244,16 @@
+         """
+         self._weight_version = int(version)
+ 
+-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+-        return await self._impl.run_rollout(input_sample)
++    async def run_rollout(
++        self,
++        input_sample: DatumSpec,
++        *,
++        rollout_group_id: Optional[str] = None,
++    ) -> PromptGroupRecord:
++        """Run one prompt group, optionally under a caller-owned attempt ID."""
++        return await self._impl.run_rollout(
++            input_sample, rollout_group_id=rollout_group_id
++        )
+ 
+     async def generate_and_push(
+         self,
+@@ -1280,7 +1324,9 @@
+                     inflight_registry[group_id] = (current_task, start_version)
+                 # Unregister before commit so cancellation cannot interrupt it.
+                 try:
+-                    record = await self.run_rollout(input_sample)
++                    record = await self.run_rollout(
++                        input_sample, rollout_group_id=group_id
++                    )
+                 finally:
+                     if inflight_registry is not None:
+                         inflight_registry.pop(group_id, None)
+--- a/tests/unit/experience/test_rollout_manager.py
++++ b/tests/unit/experience/test_rollout_manager.py
+@@ -29,6 +29,7 @@
+ import tempfile
+ import uuid
+ from copy import deepcopy
++from typing import cast
+ 
+ import pytest
+ import torch
+@@ -38,7 +39,13 @@
+ from nemo_rl.data.interfaces import DatumSpec
+ from nemo_rl.data.processors import nemo_gym_data_processor
+ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
++from nemo_rl.experience.failures import GenerationUnavailable
++from nemo_rl.experience.interfaces import (
++    NEMO_GYM_ROLLOUT_INDEX_KEY,
++    NEMO_GYM_TASK_INDEX_KEY,
++    Completion,
++    PromptGroupRecord,
++)
+ from nemo_rl.experience.rollout_manager import (
+     AsyncNemoGymRolloutImpl,
+     RolloutManager,
+@@ -120,8 +127,12 @@
+     def __init__(self, record="sentinel-record", on_run=None) -> None:
+         self._record = record
+         self._on_run = on_run
++        self.rollout_group_ids: list[str | None] = []
+ 
+-    async def run_rollout(self, input_sample):
++    async def run_rollout(
++        self, input_sample, *, rollout_group_id: str | None = None
++    ):
++        self.rollout_group_ids.append(rollout_group_id)
+         if self._on_run is not None:
+             await self._on_run(input_sample)
+         return self._record
+@@ -188,6 +199,7 @@
+ 
+         assert len(buf.reserve_calls) == 1
+         assert len(buf.remove_calls) == 1
++        assert mgr._impl.rollout_group_ids == buf.remove_calls
+         assert buf._slots == []
+         assert buf.commit_calls == []
+         assert registry == {}
+@@ -241,10 +253,35 @@
+         assert len(buf.commit_calls) == 1
+         gid, record, start_v, end_v = buf.commit_calls[0]
+         assert gid in buf._slots
++        assert impl.rollout_group_ids == [gid]
+         assert record == "r0"
+         assert start_v == 0
+         assert end_v == 0
+ 
++    def test_redispatch_gets_fresh_group_id(self):
++        attempts = 0
++
++        async def _fail_first_attempt(_sample):
++            nonlocal attempts
++            attempts += 1
++            if attempts == 1:
++                raise GenerationUnavailable("injected first-attempt failure")
++
++        buf = _FakeBuffer()
++        impl = _FakeImpl(record="recovered", on_run=_fail_first_attempt)
++        policy = RolloutRetryPolicy.single_attempt(
++            max_infra_attempts=2,
++            backoff_base_s=0.0,
++        )
++        mgr = _make_manager(buf, impl, retry_policy=policy)
++
++        _run(mgr.generate_and_push({"prompt": "p"}))
++
++        assert len(impl.rollout_group_ids) == 2
++        assert impl.rollout_group_ids[0] != impl.rollout_group_ids[1]
++        assert buf.remove_calls == [impl.rollout_group_ids[0]]
++        assert [call[0] for call in buf.commit_calls] == [impl.rollout_group_ids[1]]
++
+     def test_start_weight_version_pinned_at_reserve_time(self):
+         """If set_weight_version is called mid-rollout, start != end."""
+         buf = _FakeBuffer()
+@@ -379,22 +416,96 @@
+     assert manager._impl._mask_env_flagged_samples is False
+ 
+ 
+-def _nemo_gym_impl(mask_env_flagged_samples):
++def _nemo_gym_impl(
++    mask_env_flagged_samples: bool, num_generations_per_prompt: int = 1
++) -> AsyncNemoGymRolloutImpl:
+     return AsyncNemoGymRolloutImpl(
+         tokenizer=None,
+         task_to_env={},
+-        num_generations_per_prompt=1,
++        num_generations_per_prompt=num_generations_per_prompt,
+         max_seq_len=100,
+         max_rollout_turns=1,
+         generation_config={
+             "stop_strings": None,
+             "stop_token_ids": None,
+             "top_k": None,
++            "temperature": 0.7,
++            "top_p": 0.9,
++            "max_new_tokens": 64,
+         },
+         mask_env_flagged_samples=mask_env_flagged_samples,
+     )
+ 
+ 
++def test_nemo_gym_inputs_use_attempt_identity_without_mutating_source():
++    rollout_group_id = "12345678-1234-5678-1234-567812345678"
++    source_task_index = 17
++    input_sample = cast(
++        DatumSpec,
++        {
++            "message_log": [],
++            "extra_env_info": {
++                "agent_ref": {"name": "test_agent"},
++                "responses_create_params": {"max_output_tokens": 100},
++                NEMO_GYM_TASK_INDEX_KEY: source_task_index,
++                NEMO_GYM_ROLLOUT_INDEX_KEY: 99,
++            },
++            "task_name": "nemo_gym",
++            "idx": 0,
++        },
++    )
++    original = deepcopy(input_sample)
++    impl = _nemo_gym_impl(
++        mask_env_flagged_samples=True, num_generations_per_prompt=3
++    )
++
++    rows = impl._build_inputs(input_sample, rollout_group_id=rollout_group_id)
++
++    task_indices = [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows]
++    assert len(set(task_indices)) == 1
++    assert isinstance(task_indices[0], int)
++    assert task_indices[0] != source_task_index
++    assert 0 <= task_indices[0] < 1 << 63
++    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
++    assert [row["_rowidx"] for row in rows] == [0, 1, 2]
++    assert input_sample == original
++
++
++def test_nemo_gym_inputs_reject_invalid_attempt_identity():
++    input_sample = cast(
++        DatumSpec,
++        {"extra_env_info": {"responses_create_params": {}}},
++    )
++    impl = _nemo_gym_impl(mask_env_flagged_samples=True)
++
++    with pytest.raises(ValueError, match="rollout_group_id must be a valid UUID"):
++        impl._build_inputs(input_sample, rollout_group_id="not-a-uuid")
++
++
++def test_nemo_gym_inputs_isolate_repeated_attempts():
++    input_sample = cast(
++        DatumSpec,
++        {
++            "extra_env_info": {
++                "responses_create_params": {},
++                NEMO_GYM_TASK_INDEX_KEY: None,
++            },
++        },
++    )
++    impl = _nemo_gym_impl(mask_env_flagged_samples=True)
++
++    first = impl._build_inputs(
++        input_sample,
++        rollout_group_id="00000000-0000-4000-8000-000000000001",
++    )
++    second = impl._build_inputs(
++        input_sample,
++        rollout_group_id="00000000-0000-4000-8000-000000000002",
++    )
++
++    assert first[0][NEMO_GYM_TASK_INDEX_KEY] != second[0][NEMO_GYM_TASK_INDEX_KEY]
++
++
+ def _mask_gate_result():
+     return {
+         "message_log": [
+--- a/tests/unit/experience/test_rollout_redispatch.py
++++ b/tests/unit/experience/test_rollout_redispatch.py
+@@ -85,8 +85,10 @@
+         self._failures = list(failures)
+         self.attempts = 0
+ 
+-    async def run_rollout(self, input_sample):
+-        del input_sample
++    async def run_rollout(
++        self, input_sample, *, rollout_group_id: str | None = None
++    ):
++        del input_sample, rollout_group_id
+         index = self.attempts
+         self.attempts += 1
+         if index < len(self._failures):

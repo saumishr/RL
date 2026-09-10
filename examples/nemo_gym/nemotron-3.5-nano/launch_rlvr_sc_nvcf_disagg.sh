@@ -89,6 +89,14 @@ set -euo pipefail
 # Optional knobs (all defaulted below): NS_SANDBOX_POOL_REF,
 # NS_SANDBOX_POOL_SIZE, NS_SANDBOX_POOL_FALLBACK, NS_SANDBOX_TTL_S,
 # NEMO_GYM_RUN_ID, plus everything nano35_launch.sh accepts.
+#
+#   DISAGG_SANDBOX=1      0 keeps the NVCF judges but returns ns_tools to the
+#                         per-node sidecar. Use it when comparing throughput
+#                         against the local-judge arm, so judge placement is the
+#                         only variable; the shared warm pool is a second one,
+#                         and not one this launcher can hold constant. At 0 the
+#                         OPENSANDBOX_* and NS_SANDBOX_* requirements above are
+#                         dropped and SANDBOX_CONTAINER becomes required.
 # =============================================================================
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -100,9 +108,23 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # the judges only once rollouts start, and a missing sandbox setting kills the
 # ns_tools server after the allocation is up. Check them here.
 : "${NVIDIA_API_KEY:?NVIDIA_API_KEY is required: the NVCF key for all three hosted judges}"
-: "${OPENSANDBOX_BASE_URL:?OPENSANDBOX_BASE_URL is required for the remote sandbox pool}"
-: "${OPENSANDBOX_API_KEY:?OPENSANDBOX_API_KEY is required for the remote sandbox pool}"
-: "${NS_SANDBOX_IMAGE:?NS_SANDBOX_IMAGE is required: sandbox_pool rejects an empty image even when claiming from a pool}"
+
+# DISAGG_SANDBOX=0 keeps the NVCF judges but puts ns_tools back on the per-node
+# sidecar, leaving judge placement as the ONLY difference from the local-judge
+# arm. That is the point of the switch: with the remote pool also in play, a
+# throughput delta against nano35_launch.sh confounds two variables at once, and
+# the pool is shared, so its warmth is not even ours to hold constant between
+# arms. Default stays 1 so the all-features arm is unchanged.
+DISAGG_SANDBOX="${DISAGG_SANDBOX:-1}"
+if [[ "${DISAGG_SANDBOX}" == "1" ]]; then
+  : "${OPENSANDBOX_BASE_URL:?OPENSANDBOX_BASE_URL is required for the remote sandbox pool}"
+  : "${OPENSANDBOX_API_KEY:?OPENSANDBOX_API_KEY is required for the remote sandbox pool}"
+  : "${NS_SANDBOX_IMAGE:?NS_SANDBOX_IMAGE is required: sandbox_pool rejects an empty image even when claiming from a pool}"
+else
+  # nano35_launch.sh guards this too, but its message tells you to set
+  # NO_COLOCATED_SANDBOX=1, which is the wrong knob from inside this wrapper.
+  : "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required when DISAGG_SANDBOX=0: the nemo-skills sandbox image for the per-node sidecar}"
+fi
 
 # -----------------------------------------------------------------------------
 # Judges off the allocation
@@ -123,19 +145,35 @@ export NUM_GYM_NODES="${NUM_GYM_NODES:-2}"
 # Sandboxes off the allocation
 # -----------------------------------------------------------------------------
 # Gym's ns_tools.yaml reads all of this straight from the environment at the
-# pinned commit, which is why none of it appears in the NeMo-RL config.
-export NO_COLOCATED_SANDBOX=1
-export NS_TOOLS_SANDBOX_TYPE=sandbox_pool
-export NS_SANDBOX_POOL_REF="${NS_SANDBOX_POOL_REF:-ns-tools-warm}"
-export NS_SANDBOX_POOL_SIZE="${NS_SANDBOX_POOL_SIZE:-256}"
-# false: fail the slot instead of creating a pod on demand when the pool is
-# short. A silent fallback would answer with cold pods and read as a sandbox
-# latency regression rather than as an under-provisioned pool.
-export NS_SANDBOX_POOL_FALLBACK="${NS_SANDBOX_POOL_FALLBACK:-false}"
-export NS_SANDBOX_TTL_S="${NS_SANDBOX_TTL_S:-21600}"
-# Lean verification goes to the same sandboxes over HTTP rather than a local
-# server, so it does not need the sidecar this arm no longer starts.
-export MATH_FORMAL_LEAN_BACKEND="${MATH_FORMAL_LEAN_BACKEND:-ns_http}"
+# pinned commit, which is why none of it appears in the NeMo-RL config. That
+# also means the DISAGG_SANDBOX=0 branch has to UNSET rather than merely skip:
+# ray.sub inherits the submitting shell, and these are exactly the variables a
+# previous disagg submission left exported in it. Skipping them would hand the
+# colocated arm a live sandbox_pool backend and quietly reproduce the very
+# configuration this switch exists to remove.
+if [[ "${DISAGG_SANDBOX}" == "1" ]]; then
+  export NO_COLOCATED_SANDBOX=1
+  export NS_TOOLS_SANDBOX_TYPE=sandbox_pool
+  export NS_SANDBOX_POOL_REF="${NS_SANDBOX_POOL_REF:-ns-tools-warm}"
+  export NS_SANDBOX_POOL_SIZE="${NS_SANDBOX_POOL_SIZE:-256}"
+  # false: fail the slot instead of creating a pod on demand when the pool is
+  # short. A silent fallback would answer with cold pods and read as a sandbox
+  # latency regression rather than as an under-provisioned pool.
+  export NS_SANDBOX_POOL_FALLBACK="${NS_SANDBOX_POOL_FALLBACK:-false}"
+  export NS_SANDBOX_TTL_S="${NS_SANDBOX_TTL_S:-21600}"
+  # Lean verification goes to the same sandboxes over HTTP rather than a local
+  # server, so it does not need the sidecar this arm no longer starts.
+  export MATH_FORMAL_LEAN_BACKEND="${MATH_FORMAL_LEAN_BACKEND:-ns_http}"
+else
+  export NO_COLOCATED_SANDBOX=0
+  unset NS_TOOLS_SANDBOX_TYPE NS_SANDBOX_POOL_REF NS_SANDBOX_POOL_SIZE \
+        NS_SANDBOX_POOL_FALLBACK NS_SANDBOX_TTL_S NS_SANDBOX_IMAGE \
+        OPENSANDBOX_BASE_URL OPENSANDBOX_API_KEY
+  # Left unset so ns_tools and math_formal_lean take their in-config defaults,
+  # which target the sidecar. Forcing ns_http here would send Lean over HTTP to
+  # a pool that this branch has just torn out of the environment.
+  unset MATH_FORMAL_LEAN_BACKEND
+fi
 # Labels every claimed pod, and is the only handle for reaping leaks afterwards.
 export NEMO_GYM_RUN_ID="${NEMO_GYM_RUN_ID:-nano35-allfeatures-$(date +%m%d-%H%M%S)}"
 
@@ -159,8 +197,14 @@ export CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/rlvr_sc_n
 export TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/run_grpo_single_controller.py}"
 
 echo "[allfeatures] judges: NVCF (no GenRM hetgroup)"
-echo "[allfeatures] sandboxes: pool=${NS_SANDBOX_POOL_REF} size=${NS_SANDBOX_POOL_SIZE} fallback=${NS_SANDBOX_POOL_FALLBACK}"
-echo "[allfeatures] run id (sandbox claim label): ${NEMO_GYM_RUN_ID}"
-echo "[allfeatures] confirm the pool is warm before this job starts claiming"
+if [[ "${DISAGG_SANDBOX}" == "1" ]]; then
+  echo "[allfeatures] sandboxes: pool=${NS_SANDBOX_POOL_REF} size=${NS_SANDBOX_POOL_SIZE} fallback=${NS_SANDBOX_POOL_FALLBACK}"
+  echo "[allfeatures] run id (sandbox claim label): ${NEMO_GYM_RUN_ID}"
+  echo "[allfeatures] confirm the pool is warm before this job starts claiming"
+else
+  echo "[allfeatures] sandboxes: COLOCATED per-node sidecar (DISAGG_SANDBOX=0)"
+  echo "[allfeatures] sandbox image: ${SANDBOX_CONTAINER}"
+  echo "[allfeatures] judge placement is the only delta vs the local-judge arm"
+fi
 
 exec bash "${SCRIPT_DIR}/nano35_launch.sh" rlvr "$@"

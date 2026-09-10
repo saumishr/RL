@@ -45,6 +45,13 @@ GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-}"
 GENRM_MODEL_LOADER_EXTRA_CONFIG="${GENRM_MODEL_LOADER_EXTRA_CONFIG:-}"
 GENRM_SERVED_MODEL_NAME="${GENRM_SERVED_MODEL_NAME:-model}"
 GENRM_GROUP_ID="${GENRM_GROUP_ID:-inline-${SLURM_JOB_ID}}"
+# vLLM's admission cap for this replica. Was hardcoded at 256, which silently
+# made the Slurm control arm incomparable to the NVCF arm it exists to measure
+# against: judge throughput is bounded by how many sequences a replica will
+# admit, so the two arms have to agree on it or the comparison measures the cap
+# rather than the deployment. Defaulted to 256 to preserve behaviour for any
+# other caller; the control arm sets 1024 explicitly.
+GENRM_MAX_NUM_SEQS="${GENRM_MAX_NUM_SEQS:-256}"
 GENRM_VLLM_PORT="${GENRM_VLLM_PORT:-8000}"
 GENRM_LB_PORT="${GENRM_LB_PORT:-9213}"
 GENRM_LB_PYTHON="${GENRM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
@@ -288,7 +295,7 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     --dtype bfloat16 \
     --kv-cache-dtype fp8 \
     --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
-    --max-num-seqs 256 \
+    --max-num-seqs "${MAX_NUM_SEQS}" \
     --gpu-memory-utilization 0.95 \
     --enable-prefix-caching \
     --distributed-executor-backend ray \
@@ -376,7 +383,7 @@ for (( replica_index = 0; replica_index < GENRM_REPLICAS; replica_index++ )); do
     --nodes="${GENRM_NODES_PER_REPLICA}" \
     --ntasks="${GENRM_NODES_PER_REPLICA}" \
     --ntasks-per-node=1 \
-    --export="ALL,REPLICA_ID=${replica_id},VLLM_PORT=${GENRM_VLLM_PORT},TENSOR_PARALLEL_SIZE=${GENRM_TENSOR_PARALLEL_SIZE},MODEL=${GENRM_MODEL},VLLM_PYTHON=${GENRM_VLLM_PYTHON},REASONING_PARSER=${GENRM_REASONING_PARSER},GENRM_TOOLS_DIR=${GENRM_TOOLS_DIR_HOST},GENRM_SERVING_DIR=${GENRM_STATE_DIR},GENRM_GROUP_ID=${GENRM_GROUP_ID},HEAD_IP_FILE=${head_ip_file},LOG_FILE=${vllm_log}" \
+    --export="ALL,REPLICA_ID=${replica_id},VLLM_PORT=${GENRM_VLLM_PORT},TENSOR_PARALLEL_SIZE=${GENRM_TENSOR_PARALLEL_SIZE},MAX_NUM_SEQS=${GENRM_MAX_NUM_SEQS},MODEL=${GENRM_MODEL},VLLM_PYTHON=${GENRM_VLLM_PYTHON},REASONING_PARSER=${GENRM_REASONING_PARSER},GENRM_TOOLS_DIR=${GENRM_TOOLS_DIR_HOST},GENRM_SERVING_DIR=${GENRM_STATE_DIR},GENRM_GROUP_ID=${GENRM_GROUP_ID},HEAD_IP_FILE=${head_ip_file},LOG_FILE=${vllm_log}" \
     --output="${GENRM_LOG_DIR}/replica_${replica_index}_%t.log" \
     bash -c "${GENRM_BODY}" &
   genrm_step_pids+=("$!")

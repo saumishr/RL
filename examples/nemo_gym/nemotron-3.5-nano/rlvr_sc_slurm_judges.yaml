@@ -17,11 +17,26 @@
 # async_rl rather than merging into it, so it has to stay last; putting it first
 # would silently discard the streaming settings rlvr_sc.yaml contributes.
 #
-# THE JUDGE SHAPES ARE NOT INHERITED UNCHANGED. rlvr.yaml sizes the two
-# gym-resident judges for a standalone 86-node run (nl2bash TP4xDP4, safety
-# TP4xDP2). This arm instead matches the NVCF deployment replica-for-replica and
-# GPU-for-GPU, which is a different shape, and those overrides are passed on the
-# command line by submit_control_slurm_judges.sh rather than written here.
+# THE JUDGE SHAPES ARE NOT INHERITED UNCHANGED, AND ONLY SAFETY IS STILL
+# GYM-RESIDENT. rlvr.yaml sizes both judges as in-process local_vllm_models
+# (nl2bash TP4xDP4, safety TP4xDP2). This arm keeps safety that way but serves
+# nl2bash as an EXTERNAL pool on hetgroup 1, four independent TP4 DP=1 servers
+# behind vllm_pool_lb, the same arrangement GenRM already uses. Safety's shape
+# is overridden on the command line by submit_control_slurm_judges.sh; nl2bash's
+# is set by the pool registration in nano35_launch.sh, and the launcher injects
+# base_url once the load balancer is healthy, which is what makes Gym skip
+# launching the in-process copy.
+#
+# nl2bash moved because the in-process arrangement deadlocked. In job 3656607 its
+# single-process Gym proxy accepted 594 concurrent judge requests and forwarded
+# none: the vLLM engines behind it sat at Running 0 / Waiting 0 while ~2,000
+# rollouts queued behind the graders. num_workers cannot fix that, because a
+# local_vllm_model owns its engine and forking the server forks the engine.
+#
+# The 16-GPU budget is unchanged; it is served as 4xTP4 rather than NVCF's 8xTP2
+# because each pool replica owns whole 4-GPU nodes. That is the one place this
+# arm's judge topology departs from NVCF's, and it is not avoidable without
+# teaching the wrapper to pack replicas per node.
 #
 # That split is deliberate. Overriding vllm_serve_kwargs in YAML risks replacing
 # the whole mapping and taking attention_backend, gpu_memory_utilization and
@@ -35,8 +50,21 @@
 # sandbox-related appears here or in rlvr_sc_nvcf_disagg.yaml.
 #
 # Entrypoint: examples/run_grpo_single_controller.py, via nano35_launch.sh with
-# HOSTED_JUDGES=0 (its default). 82 nodes: 32 train + 32 gen + 6 gym + 12 GenRM.
+# HOSTED_JUDGES=0 (its default). 82 nodes, unchanged in total but redistributed:
+# 32 train + 32 gen + 2 gym on hetgroup 0, and 12 GenRM + 4 NL2Bash on
+# hetgroup 1. Gym drops from 6 nodes to 2 because it now holds only safety's 4
+# GPUs plus the CPU-only Gym servers; the 20 GPUs the two judges used to want are
+# what made it 6.
 # =============================================================================
 defaults:
   - rlvr_sc.yaml
   - readyfirst_cpu_rdma.yaml
+  # gym_fanout_lag4.yaml is deliberately NOT inherited. The NVCF arm this run
+  # is paired against (job 3657252) was submitted before that file existed, so
+  # inheriting it here would change lag, in-flight depth, connector limits and
+  # uvicorn worker counts on one side of an A/B whose only intended variable is
+  # where the judges are hosted. It also would not have helped: job 3656607
+  # deadlocked on nl2bash_judge_model's single-process Gym proxy, which holds
+  # requests without forwarding them, and that server is a local_vllm_model --
+  # the one class num_workers must not fan out, because forking it forks the
+  # engine.

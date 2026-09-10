@@ -1,0 +1,10 @@
+/lustre/fsw/portfolios/llmservice/users/${USER}/.cache/nemotron_ultra
+/lustre/fsw/portfolios/llmservice/users/${USER}/hf_home
+/lustre/fsw/portfolios/llmservice/users/ansubramania/models/Qwen3-235B-A22B-Instruct-2507-FP8
+/lustre/fsw/portfolios/llmservice/users/ansubramania/models/qwen235b_principle_comparison_genrm_step1230
+/lustre/fsw/portfolios/llmservice/users/ansubramania/super_v3/model_checkpoints/Nemotron-Content-Safety-Reasoning-4B
+/lustre/fsw/portfolios/llmservice/users/jiaqiz/data/gym/rl-data-tools/blends/curriculum_v35_inescapable-sawfly.train.efforts0p15_qamathcode.jsonl
+/lustre/fsw/portfolios/llmservice/users/jiaqiz/models/ultra_stage2sft_step300
+/lustre/fsw/portfolios/llmservice/users/sauramishra/images-striped/main_ultra_recipes_prebaked_venvs_20260730.plus_sandbox_venvs.sqsh
+/lustre/fsw/portfolios/llmservice/users/sauramishra/images-striped/nemo-rl-nightly-20260806-sandbox.squashfs
+/lustre/fsw/portfolios/llmservice/users/sauramishra/images-striped/nemo-skills-sandbox-dc43f3e.sqsh

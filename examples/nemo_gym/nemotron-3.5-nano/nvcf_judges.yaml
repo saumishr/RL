@@ -32,23 +32,90 @@
 #     the GenRM hetgroup is serving them. rlvr_sc_nvcf_disagg.yaml's launcher
 #     sets NUM_EXTERNAL_SERVICE_NODES=0 for exactly this reason.
 # =============================================================================
+# NVCF_JUDGE_BASE_URL redirects all three judges without editing this file, so
+# a routing change can be A/B tested. Unset, the default below is the gateway.
+#
+# Why the idle timeout needs handling at all: these endpoints sit behind AWS
+# Global Accelerator, which drops any connection carrying no application-layer
+# data for 340s. TCP keepalive does not reset that timer (only bytes above TCP
+# count) and aiohttp has no HTTP/2 support, so it cannot send the PING frames
+# that would. GenRM is the judge that trips this, being the only one with
+# max_output_tokens=24576.
+#
+# This was previously handled by the h2-ping-sidecar, a per-node Go proxy that
+# re-spoke the request over HTTP/2 and sent PING frames. It is replaced by
+# global_aiohttp_crlf_heartbeat_seconds below (Gym PR #3117), which solves the
+# same problem inside the client: a bare CRLF written on each in-flight
+# connection is TLS payload to the accelerator, and RFC 9112 2.2 requires
+# servers to ignore empty lines before a request-line. That removes the proxy
+# hop, the loopback port, and the per-node readiness gate that made jobs 3542407
+# and 3542717 fail on placement rather than on anything to do with judging.
+#
+# The default is single-quoted because OmegaConf parses a resolver's default
+# argument, and a bare https:// URL is ambiguous in that grammar.
+# GenRM gets its OWN base_url variable, separate from the other two judges.
+# NVCF's direct invocation API puts the function UUID in the hostname
+# (https://<uuid>.invocation.api.nvcf.nvidia.com/v1), so a single shared value
+# cannot serve three different functions -- pointing all three at GenRM's UUID
+# would silently route the safety and nl2bash judges to the GenRM function.
+# NVCF_JUDGE_BASE_URL still drives those two; NVCF_GENRM_BASE_URL drives GenRM.
+#
+# On the invocation API, NVCF stops holding a request open after
+# NVCF-POLL-SECONDS and answers 202 with an NVCF-REQID header, expecting the
+# caller to poll https://api.nvcf.nvidia.com/v2/nvcf/pexec/status/<reqid>.
+# NeMoGymAsyncOpenAI._resolve_nvcf_pending handles that (and the 302
+# large-result redirect); without it the 202's metadata body is parsed as a
+# completion and every slow judgement silently becomes default_score.
 env:
   nemo_gym:
+    # Replaces the h2-ping-sidecar (see header). Writes a bare CRLF on every
+    # in-flight connection this often, which the accelerator counts as payload
+    # and so does not reset its 340s idle timer against us. 60s is the interval
+    # the PR measured against that timeout, and matches the sidecar's old
+    # H2_PING_INTERVAL, so this arm changes the mechanism and not the cadence.
+    #
+    # This is a property of the global aiohttp client, so it applies to all of
+    # this process's outbound calls, not just GenRM's. That is harmless: the
+    # pass only touches connections with a request in flight, never idle pooled
+    # ones, and costs ~20us of TLS write per in-flight connection per pass.
+    # OFF. Measured against real traffic this truncates large judge responses:
+    # the nl2bash/safety leg, on the same endpoint and models throughout, logged
+    # 0 truncations in 4,609 groups on 0905 with this unset, and 39 in 191 groups
+    # on 0909 with it at 60. Nothing else on that path changed.
+    #
+    # The CRLF is written on connections with a request IN FLIGHT, so it lands
+    # while the gateway is streaming the response back; an intermediary that
+    # reads it as a pipelined request can tear the connection down mid-body.
+    # Hence truncation at clean 124/192/512 KiB boundaries, and only for large
+    # responses -- at 60s only a body still open when a beat fires is exposed.
+    # Job 3654262 died when one such truncation surfaced as HTTP 400, which
+    # classifies DATA and so ends the run outright under ready_first.
+    #
+    # Reverted to the h2-ping-sidecar, whose PING is a real HTTP/2 frame on its
+    # own stream rather than bytes injected into an in-flight HTTP/1.1 response.
+    # Enabled in submit_full_allfeatures_invocation.sh (H2_PING_SIDECAR), which
+    # also explains why only GenRM is routed through it.
+    global_aiohttp_crlf_heartbeat_seconds: 0
     genrm_model:
       responses_api_models:
         genrm_model:                    # note: nested key repeats the block name
-          base_url: ["https://integrate.api.nvidia.com/v1"]
+          base_url: ["${oc.env:NVCF_GENRM_BASE_URL,'https://integrate.api.nvidia.com/v1'}"]
           api_key: ${oc.env:NVIDIA_API_KEY}
           model: private/ultra-genrm/nvidia/nemotron3-ultra-genrm
+          # Inherited from VLLMModelConfig and merged into every request by
+          # NeMoGymAsyncOpenAI._request. Must be strings: the field is
+          # Dict[str, str] and an int fails pydantic validation.
+          default_headers:
+            NVCF-POLL-SECONDS: "3600"
     nl2bash_judge_model:
       responses_api_models:
         local_vllm_model:               # note: NOT nl2bash_judge_model
-          base_url: ["https://integrate.api.nvidia.com/v1"]
+          base_url: ["${oc.env:NVCF_JUDGE_BASE_URL,'https://integrate.api.nvidia.com/v1'}"]
           api_key: ${oc.env:NVIDIA_API_KEY}
           model: private/nemotron/qwen/qwen3-235b-a22b-instruct-2507
     safety_judge_model:
       responses_api_models:
         local_vllm_model:
-          base_url: ["https://integrate.api.nvidia.com/v1"]
+          base_url: ["${oc.env:NVCF_JUDGE_BASE_URL,'https://integrate.api.nvidia.com/v1'}"]
           api_key: ${oc.env:NVIDIA_API_KEY}
           model: private/nemotron/nvidia/nemotron-content-safety-reasoning-4b

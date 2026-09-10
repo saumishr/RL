@@ -172,6 +172,49 @@ def _typed_gym_failure(error: Exception) -> Optional[Exception]:
     return RolloutDataFailure(detail)
 
 
+def _log_gym_data_failure_forensics(error: BaseException) -> None:
+    """Describe a data-classified gym HTTP failure loudly enough to diagnose it later.
+
+    A DATA classification ends the run outright on any arm whose sampler forbids a
+    drop budget -- which is every ready_first recipe, since only in_order stamps a
+    target step and only a stamped step can be credited short. So the one line such a
+    failure otherwise leaves behind (status, message, url) has to be enough to tell a
+    poisoned dataset row apart from a corrupted request. It is not.
+
+    Job 3654262 died 18 minutes into a 66-node allocation on::
+
+        RolloutDataFailure: NeMo-Gym /run failed with HTTP 400: 400,
+        message='Bad Request', url='http://10.67.22.148:5780/run'
+
+    with an empty body and nothing whatsoever on the Gym side: no app log, no handler,
+    no traceback. Gym's own middleware answers 500 for everything it catches, so a bare
+    400 means uvicorn's parser rejected the bytes BEFORE the request reached the
+    application. The interesting evidence is therefore the REQUEST framing rather than
+    the response, which is why request_info's headers are logged here: Content-Length
+    and Transfer-Encoding are what a parser-level 400 turns on.
+
+    response_content is printed through repr() so "empty body" and "no body attribute"
+    stay distinguishable. The pre-existing EXCEPTION RESULT print renders both as
+    nothing at all, which is how the original 400 escaped with no evidence.
+    """
+    request_info = getattr(error, "request_info", None)
+    headers = getattr(request_info, "headers", None) or {}
+    print(
+        "GYM_DATA_FAILURE_FORENSICS "
+        f"type={type(error).__name__} "
+        f"status={getattr(error, 'status', None)!r} "
+        f"method={getattr(request_info, 'method', None)!r} "
+        f"url={getattr(request_info, 'url', None)!r} "
+        f"content_length={headers.get('Content-Length')!r} "
+        f"transfer_encoding={headers.get('Transfer-Encoding')!r} "
+        f"content_type={headers.get('Content-Type')!r} "
+        f"expect={headers.get('Expect')!r} "
+        f"response_content={getattr(error, 'response_content', '<absent>')!r:.2000}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def get_nemo_gym_uv_cache_dir() -> str | None:
     """Return the uv cache directory inside a container, or None outside one.
 
@@ -714,6 +757,12 @@ Depending on your data shape, you may want to change these values."""
                             file=sys.stderr,
                         )
                     typed = _typed_gym_failure(error)
+                    # Only the DATA branch is worth the noise: it is the one that is
+                    # capped at max_data_attempts_per_prompt and then ends the run,
+                    # whereas GymTransportError re-enters shard selection and is
+                    # routinely survived thousands of times per step.
+                    if isinstance(typed, RolloutDataFailure):
+                        _log_gym_data_failure_forensics(error)
                     if typed is not None:
                         # `from None`, deliberately: chaining the original would put the
                         # unpicklable exception back on the wire as __cause__ and undo

@@ -53,14 +53,20 @@ set -euo pipefail
 #   HOSTED_JUDGES=0                        1 when every judge is served off the
 #                                          allocation (endpoints in the config);
 #                                          drops the judge checkpoint
-#                                          requirements and the GenRM hetgroup
+#                                          requirements and the external-service
+#                                          hetgroup
 #   NO_COLOCATED_SANDBOX=0                 1 when ns_tools reaches sandboxes over
 #                                          the network instead of the per-node
 #                                          sidecar; makes SANDBOX_CONTAINER
 #                                          optional
-#   NUM_EXTERNAL_SERVICE_NODES=0            Nodes reserved outside training Ray
+#   NUM_EXTERNAL_SERVICE_NODES=0            Nodes reserved outside training Ray.
+#                                          Derived from the registered external
+#                                          vLLM pools on the RLVR judge path,
+#                                          so it is not settable there
 #   GENRM_SEGMENT_SIZE=                      Segment size for the external
 #                                          service hetgroup
+#   NL2BASH_REPLICAS=4                      Independent external nl2bash servers
+#   NL2BASH_TENSOR_PARALLEL_SIZE=4          TP per external nl2bash server
 #   CPUS_PER_WORKER=                       Cores claimed per node; unset lets
 #                                          ray.sub detect CPUTot from SLURM.
 #                                          Set only for a heterogeneous
@@ -70,6 +76,15 @@ set -euo pipefail
 #                                          with the tree is used as-is instead
 #                                          of triggering a re-lock. Required
 #                                          where compute has no package egress
+#   UV_CACHE_DIR=                          Forwarded only when set. Leave unset
+#                                          so uv reads the image's baked cache;
+#                                          a fresh per-job path re-downloads
+#                                          wheels the image already has
+#   NRL_EXTRA_PYTHONPATH=                  Prepended to PYTHONPATH in the driver.
+#                                          Lets a checkout that outgrew its
+#                                          image borrow the missing packages
+#                                          from a prebuilt directory instead of
+#                                          rebuilding the image
 #   BATCH_SCRIPT=ray.sub                    Slurm entrypoint; external services
 #                                          may wrap ray.sub
 #   ENABLE_MTP_INFERENCE=0                 1 to enable MTP speculative decoding
@@ -126,21 +141,28 @@ case "${RECIPE}" in
     GENRM_MODEL=""
     GENRM_API_MODEL_NAME=""
     NL2BASH_JUDGE_MODEL=""
+    NL2BASH_BASE_URL=""
     SAFETY_JUDGE_MODEL=""
     ;;
   rlvr)
     CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/rlvr.yaml}"
     NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-32}"
     NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
-    NUM_GYM_NODES="${NUM_GYM_NODES:-6}"
+    # Two, not six. The gym tier used to hold nl2bash (16 GPUs) alongside safety
+    # (4-8 GPUs); nl2bash now serves from its own external pool, so what is left
+    # on the allocation is the safety judge plus the CPU-only Gym servers. Two
+    # nodes cover safety at either shape it is run with -- rlvr.yaml's TP4xDP2
+    # (8 GPUs) or the NVCF-matched TP1x4 (4 GPUs) -- and keep the Ray total even
+    # for SEGMENT_SIZE=2.
+    NUM_GYM_NODES="${NUM_GYM_NODES:-2}"
     SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
 
     # HOSTED_JUDGES=1 means GenRM, NL2Bash and the safety judge are all served
     # off the allocation (NVCF, say) with their endpoints and model names in the
-    # config. There is then no local checkpoint to point at, no GenRM hetgroup
-    # to raise, and no judge override to emit: a `.model=` on the command line
-    # beats the config, so it would point a hosted judge back at a local path
-    # while the YAML still looked correct.
+    # config. There is then no local checkpoint to point at, no external-service
+    # hetgroup to raise, and no judge override to emit: a `.model=` on the
+    # command line beats the config, so it would point a hosted judge back at a
+    # local path while the YAML still looked correct.
     HOSTED_JUDGES="${HOSTED_JUDGES:-0}"
     if [[ "${HOSTED_JUDGES}" == "1" ]]; then
       NUM_EXTERNAL_SERVICE_NODES="${NUM_EXTERNAL_SERVICE_NODES:-0}"
@@ -152,10 +174,9 @@ case "${RECIPE}" in
       GENRM_MODEL=""
       GENRM_API_MODEL_NAME=""
       NL2BASH_JUDGE_MODEL=""
+      NL2BASH_BASE_URL=""
       SAFETY_JUDGE_MODEL=""
     else
-      NUM_EXTERNAL_SERVICE_NODES="${NUM_EXTERNAL_SERVICE_NODES:-16}"
-
       : "${GENRM_MODEL:?GENRM_MODEL is required for the RLVR recipe}"
       : "${GENRM_REASONING_PARSER:?GENRM_REASONING_PARSER is required for the RLVR recipe}"
       : "${NL2BASH_JUDGE_MODEL:?NL2BASH_JUDGE_MODEL is required for the RLVR recipe}"
@@ -166,7 +187,6 @@ case "${RECIPE}" in
       GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-8}"
       GENRM_SERVED_MODEL_NAME="${GENRM_SERVED_MODEL_NAME:-model}"
       GENRM_API_MODEL_NAME="${GENRM_API_MODEL_NAME:-${GENRM_SERVED_MODEL_NAME}}"
-      NUM_GENRM_NODES="${NUM_GENRM_NODES:-${NUM_EXTERNAL_SERVICE_NODES}}"
       GENRM_VLLM_PORT="${GENRM_VLLM_PORT:-8000}"
       GENRM_LB_PORT="${GENRM_LB_PORT:-9213}"
       GENRM_STARTUP_TIMEOUT="${GENRM_STARTUP_TIMEOUT:-3600}"
@@ -177,27 +197,134 @@ case "${RECIPE}" in
       GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
       GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-{\"pass_config\":{\"fuse_allreduce_rms\":false}}}"
       GENRM_MODEL_LOADER_EXTRA_CONFIG="${GENRM_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":96}}"
-      GENRM_TOOLS_DIR_HOST="${GENRM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_genrm}"
+      # Judge admission cap. The retired external_genrm wrapper read
+      # GENRM_MAX_NUM_SEQS itself and defaulted to 256; the pool interface has
+      # no opinion, so the default moves here. 1024 across every judge is a
+      # campaign requirement -- a tier that admits 256 while another admits
+      # 1024 measures the cap rather than the deployment.
+      GENRM_MAX_NUM_SEQS="${GENRM_MAX_NUM_SEQS:-1024}"
+
+      # nl2bash is served from its own external pool rather than in-process by
+      # Gym. Its single-process Gym HTTP proxy deadlocked in production: it
+      # accepted 594 concurrent judge requests and forwarded none, leaving its
+      # own vLLM engines at "Running: 0, Waiting: 0". A pool behind a load
+      # balancer has no such shared proxy. The safety judge stays gym-resident;
+      # it was healthy at the same concurrency.
+      NL2BASH_BASE_URL="__NL2BASH_BASE_URL__"
+      NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-4}"
+      NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
+      NL2BASH_SERVED_MODEL_NAME="${NL2BASH_SERVED_MODEL_NAME:-model}"
+      NL2BASH_API_MODEL_NAME="${NL2BASH_API_MODEL_NAME:-${NL2BASH_SERVED_MODEL_NAME}}"
+      NL2BASH_VLLM_PORT="${NL2BASH_VLLM_PORT:-8000}"
+      NL2BASH_LB_PORT="${NL2BASH_LB_PORT:-9214}"
+      NL2BASH_STARTUP_TIMEOUT="${NL2BASH_STARTUP_TIMEOUT:-3600}"
+      NL2BASH_CONTAINER="${NL2BASH_CONTAINER:-${GENRM_CONTAINER}}"
+      NL2BASH_VLLM_PYTHON="${NL2BASH_VLLM_PYTHON:-${GENRM_VLLM_PYTHON}}"
+      NL2BASH_TOOL_CALL_PARSER="${NL2BASH_TOOL_CALL_PARSER:-hermes}"
+      NL2BASH_ENABLE_EXPERT_PARALLEL="${NL2BASH_ENABLE_EXPERT_PARALLEL:-1}"
+      NL2BASH_ATTENTION_BACKEND="${NL2BASH_ATTENTION_BACKEND:-TRITON_ATTN}"
+      NL2BASH_MAX_MODEL_LEN="${NL2BASH_MAX_MODEL_LEN:-131072}"
+      NL2BASH_MAX_NUM_SEQS="${NL2BASH_MAX_NUM_SEQS:-1024}"
+      NL2BASH_COMPILATION_CONFIG="${NL2BASH_COMPILATION_CONFIG:-{\"cudagraph_capture_sizes\":[1,2,4,8,16,32,64,128,256]}}"
+      NL2BASH_MODEL_LOADER_EXTRA_CONFIG="${NL2BASH_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":112}}"
+
+      # Keep deployment-specific service definitions in this launcher. The
+      # allocation wrapper consumes only pools registered through this
+      # interface, and registration exports the normalized POOL_* contract it
+      # reads -- which is why the old explicit GENRM_* export list is gone.
+      source "${PROJECT_ROOT}/tools/external_gym_vllm/pool_config.sh"
+      EXTERNAL_VLLM_POOLS=""
+      EXTERNAL_VLLM_SHARED_ROOT="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
+      EXTERNAL_VLLM_TOOLS_DIR_HOST="${EXTERNAL_VLLM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_gym_vllm}"
+      EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
+      register_external_vllm_pool GENRM \
+        --display-name GenRM \
+        --model "${GENRM_MODEL}" \
+        --container "${GENRM_CONTAINER}" \
+        --python "${GENRM_VLLM_PYTHON}" \
+        --replicas "${GENRM_REPLICAS}" \
+        --tensor-parallel-size "${GENRM_TENSOR_PARALLEL_SIZE}" \
+        --served-model-name "${GENRM_SERVED_MODEL_NAME}" \
+        --vllm-port "${GENRM_VLLM_PORT}" \
+        --lb-port "${GENRM_LB_PORT}" \
+        --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
+        --url-placeholder "${GENRM_BASE_URL}" \
+        --shared-path "${GENRM_REASONING_PARSER}"
+      external_vllm_pool_env GENRM \
+        "FLASHINFER_WORKSPACE_BASE=/tmp" \
+        "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
+        "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
+      # ultra_v3 is not a parser vLLM ships, so the plugin file travels with the
+      # pool as a shared path and is registered by name at startup.
+      genrm_vllm_args=(
+        --trust-remote-code
+        --dtype bfloat16
+        --kv-cache-dtype fp8
+        --max-num-seqs "${GENRM_MAX_NUM_SEQS}"
+        --gpu-memory-utilization 0.95
+        --enable-prefix-caching
+        --reasoning-parser-plugin "${GENRM_REASONING_PARSER}"
+        --reasoning-parser "${GENRM_REASONING_PARSER_NAME}"
+        --enable-auto-tool-choice
+        --tool-call-parser "${GENRM_TOOL_CALL_PARSER}"
+        --compilation-config "${GENRM_COMPILATION_CONFIG}"
+        --model-loader-extra-config "${GENRM_MODEL_LOADER_EXTRA_CONFIG}"
+      )
+      [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" == "1" ]] && genrm_vllm_args+=(--enable-expert-parallel)
+      external_vllm_pool_args GENRM "${genrm_vllm_args[@]}"
+
+      register_external_vllm_pool NL2BASH \
+        --display-name NL2Bash \
+        --model "${NL2BASH_JUDGE_MODEL}" \
+        --container "${NL2BASH_CONTAINER}" \
+        --python "${NL2BASH_VLLM_PYTHON}" \
+        --replicas "${NL2BASH_REPLICAS}" \
+        --tensor-parallel-size "${NL2BASH_TENSOR_PARALLEL_SIZE}" \
+        --served-model-name "${NL2BASH_SERVED_MODEL_NAME}" \
+        --vllm-port "${NL2BASH_VLLM_PORT}" \
+        --lb-port "${NL2BASH_LB_PORT}" \
+        --startup-timeout "${NL2BASH_STARTUP_TIMEOUT}" \
+        --url-placeholder "${NL2BASH_BASE_URL}"
+      external_vllm_pool_env NL2BASH \
+        "FLASHINFER_WORKSPACE_BASE=/tmp" \
+        "VLLM_USE_FLASHINFER_MOE_FP16=0" \
+        "VLLM_USE_FLASHINFER_MOE_FP8=0" \
+        "VLLM_USE_DEEP_GEMM=0" \
+        "VLLM_MOE_USE_DEEP_GEMM=0" \
+        "NCCL_MNNVL_ENABLE=1"
+      # These reproduce rlvr.yaml's nl2bash vllm_serve_kwargs, minus the
+      # in-Gym-only parallelism keys and with the 256-sequence admission cap
+      # raised to 1024. uses_reasoning_parser is false for this judge, so no
+      # --reasoning-parser is passed.
+      nl2bash_vllm_args=(
+        --dtype bfloat16
+        --pipeline-parallel-size 1
+        --max-model-len "${NL2BASH_MAX_MODEL_LEN}"
+        --max-num-seqs "${NL2BASH_MAX_NUM_SEQS}"
+        --gpu-memory-utilization 0.85
+        --enable-prefix-caching
+        --enable-chunked-prefill
+        --enable-auto-tool-choice
+        --tool-call-parser "${NL2BASH_TOOL_CALL_PARSER}"
+        --attention-backend "${NL2BASH_ATTENTION_BACKEND}"
+        --compilation-config "${NL2BASH_COMPILATION_CONFIG}"
+        --model-loader-extra-config "${NL2BASH_MODEL_LOADER_EXTRA_CONFIG}"
+      )
+      [[ "${NL2BASH_ENABLE_EXPERT_PARALLEL}" == "1" ]] && nl2bash_vllm_args+=(--enable-expert-parallel)
+      external_vllm_pool_args NL2BASH "${nl2bash_vllm_args[@]}"
+
+      # Derived from the registered pools, not asserted: the hetgroup has to
+      # hold exactly sum(replicas x TP / GPUS_PER_NODE) nodes, and a hardcoded
+      # count that disagrees is a topology failure discovered after the queue.
+      NUM_EXTERNAL_SERVICE_NODES="${EXTERNAL_VLLM_NUM_NODES}"
+
       RAY_SUB="${RAY_SUB:-${PROJECT_ROOT}/ray.sub}"
-      BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_genrm/run_in_allocation.sh}"
+      BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_gym_vllm/run_in_allocation.sh}"
       export \
-        GENRM_COMPILATION_CONFIG \
-        GENRM_CONTAINER \
-        GENRM_ENABLE_EXPERT_PARALLEL \
-        GENRM_LB_PORT \
-        GENRM_MODEL \
-        GENRM_MODEL_LOADER_EXTRA_CONFIG \
-        GENRM_REASONING_PARSER \
-        GENRM_REASONING_PARSER_NAME \
-        GENRM_REPLICAS \
-        GENRM_SERVED_MODEL_NAME \
-        GENRM_STARTUP_TIMEOUT \
-        GENRM_TENSOR_PARALLEL_SIZE \
-        GENRM_TOOL_CALL_PARSER \
-        GENRM_TOOLS_DIR_HOST \
-        GENRM_VLLM_PORT \
-        GENRM_VLLM_PYTHON \
-        NUM_GENRM_NODES
+        EXTERNAL_VLLM_LB_PYTHON \
+        EXTERNAL_VLLM_POOLS \
+        EXTERNAL_VLLM_SHARED_ROOT \
+        EXTERNAL_VLLM_TOOLS_DIR_HOST
     fi
     ;;
   *)
@@ -239,6 +366,8 @@ cd "${PROJECT_ROOT}"
 # judges; SWE uses code-execution rewards and needs none of them. Set these per
 # recipe; unset variables skip the corresponding override.
 NL2BASH_JUDGE_MODEL="${NL2BASH_JUDGE_MODEL:-}"
+NL2BASH_BASE_URL="${NL2BASH_BASE_URL:-}"
+NL2BASH_API_MODEL_NAME="${NL2BASH_API_MODEL_NAME:-}"
 SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-}"
 GENRM_BASE_URL="${GENRM_BASE_URL:-}"
 GENRM_MODEL="${GENRM_MODEL:-}"
@@ -251,6 +380,20 @@ if [[ -n "${GENRM_BASE_URL}" ]]; then
   fi
 elif [[ -n "${GENRM_MODEL}" ]]; then
   GENRM_OVERRIDE="env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=${GENRM_MODEL}"
+fi
+# A base_url on a local_vllm_model server is what makes Gym skip launching the
+# in-process vLLM (documented in rlvr.yaml above genrm_model), so this override
+# is what actually moves nl2bash off the gym tier. With no base_url -- SWE, or
+# HOSTED_JUDGES=1 where nvcf_judges.yaml supplies the endpoints -- it falls back
+# to pointing the in-Gym server at the local checkpoint, exactly as before.
+NL2BASH_OVERRIDE=""
+if [[ -n "${NL2BASH_BASE_URL}" ]]; then
+  NL2BASH_OVERRIDE="++env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.base_url=${NL2BASH_BASE_URL}"
+  if [[ -n "${NL2BASH_API_MODEL_NAME}" ]]; then
+    NL2BASH_OVERRIDE="${NL2BASH_OVERRIDE} env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=${NL2BASH_API_MODEL_NAME}"
+  fi
+elif [[ -n "${NL2BASH_JUDGE_MODEL}" ]]; then
+  NL2BASH_OVERRIDE="env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=${NL2BASH_JUDGE_MODEL}"
 fi
 
 # SIF_DIR: for the SWE recipe — directory containing Apptainer .sif
@@ -349,7 +492,24 @@ slurm_walltime_seconds() {
 
 if [[ -z "${SLURM_QOS}" ]]; then
   if WALLTIME_SECONDS="$(slurm_walltime_seconds "${WALLTIME}")"; then
-    if (( WALLTIME_SECONDS < 2 * 60 * 60 )); then
+    # <=, not <. The short QoS has MaxWall=02:00:00, so a job asking for exactly
+    # 2:00:00 is the LONGEST job it accepts, not the first one it rejects. With
+    # a strict < the most common smoke walltime -- a round 2 hours -- fell
+    # through to the account default of normal, which is both lower priority
+    # (100 vs short's 200) and, unlike short, preemptible by other jobs in its
+    # own QoS (PreemptMode=within,requeue vs requeue).
+    #
+    # That is how the 10-node control smoke 3655075 was lost: submitted with
+    # WALLTIME=02:00:00, it ran at normal and was preempted by
+    # svc-hwinf-cs-sched at 30:50, about ten minutes short of its first step.
+    # Nothing had failed -- safety was serving, GenRM had published its LB URL,
+    # and nl2bash had finished loading weights.
+    #
+    # Second occurrence of this exact comparison. The first cost a 35-hour queue
+    # wait on the Ultra 2K smoke (job 3613460) and was fixed only in
+    # gymscale/ultra-2k/ultra_launch.sh, leaving this copy of the logic
+    # untouched. If a third launcher grows the same block, fix it there too.
+    if (( WALLTIME_SECONDS <= 2 * 60 * 60 )); then
       SLURM_QOS=short
     fi
   else
@@ -727,7 +887,13 @@ export RAY_SUB
 # then seed fresh from Lustre.
 # =============================================================================
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
-command -v zstd >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zstd; } 2>/dev/null || true
+# zstd only speeds up cache seeding, so a node that cannot install it should
+# degrade rather than block. The timeouts matter because some nodes have no
+# outbound egress: there apt-get does not fail, it hangs indefinitely, and
+# '2>/dev/null || true' bounds errors but not time. One such node stalls the
+# whole job -- the raylet never starts, so ray.sub waits at N-4 of N actors
+# until its 1800s deadline. Observed on nvl72d075-T17 in job 3407358.
+command -v zstd >/dev/null 2>&1 || { timeout 60 apt-get update -qq && timeout 120 apt-get install -y -qq zstd; } 2>/dev/null || true
 echo "[CACHE SEED] Clearing stale /tmp caches and seeding from Lustre..."
 WARM_SEED="${NRL_VLLM_CACHE_SEED_DIR}"
 LOCAL_IND="${INDUCTOR_CACHE_DIR}"
@@ -775,6 +941,11 @@ export SETUP_COMMAND
 # Stage-specific hyperparameters (batch sizes, advantage clip, MoE parallelism,
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
+#
+# UV_CACHE_DIR is forwarded only when the caller sets it. ray.sub unsets it on
+# purpose so uv reads the image's baked /root/.cache/uv; pointing it at a fresh
+# per-job directory instead makes uv re-download wheels the image already
+# carries, which on an egress-restricted cluster looks exactly like a hang.
 # =============================================================================
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${VLLM_ENV_SOURCE}\
@@ -786,11 +957,12 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
+${UV_CACHE_DIR:+UV_CACHE_DIR=${UV_CACHE_DIR} }\
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
 ${UV_FROZEN:+UV_FROZEN=${UV_FROZEN} }\
+${NRL_EXTRA_PYTHONPATH:+PYTHONPATH=${NRL_EXTRA_PYTHONPATH} }\
 VLLM_USE_FLASHINFER_MOE_FP8=1 \
 VLLM_FLASHINFER_MOE_BACKEND=latency \
 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
@@ -810,7 +982,7 @@ ${CHECKPOINTING_SAVE_BY:+checkpointing.checkpoint_must_save_by=${CHECKPOINTING_S
 data.train.data_path=${TRAIN_PATH} \
 data.validation.data_path=${VAL_PATH} \
 ${GENRM_OVERRIDE:+${GENRM_OVERRIDE}} \
-${NL2BASH_JUDGE_MODEL:+env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=${NL2BASH_JUDGE_MODEL}} \
+${NL2BASH_OVERRIDE:+${NL2BASH_OVERRIDE}} \
 ${SAFETY_JUDGE_MODEL:+env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.model=${SAFETY_JUDGE_MODEL}} \
 ${SIF_DIR:+sif_dir=${SIF_DIR}} \
 env.nemo_gym.nemo_gym_log_dir=${LOG_DIR}/nemo_gym \
@@ -823,6 +995,12 @@ ${MTP_EXTRA_ARGS} \
 ${*}"
 
 export COMMAND="${TRAIN_CMD}"
+# Placeholders, shared paths, tool files and the requested hetgroup size are all
+# checked here rather than after the allocation is up. Only the external-pool
+# path registers pools; HOSTED_JUDGES=1 and SWE have none to validate.
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  validate_external_vllm_submission "${COMMAND}" "${NUM_EXTERNAL_SERVICE_NODES}"
+fi
 
 # =============================================================================
 # Summary
@@ -841,8 +1019,9 @@ echo "    Training:  ${NUM_TRAIN_NODES}  ($((NUM_TRAIN_NODES * GPUS_PER_NODE)) G
 echo "    vLLM gen:  ${NUM_GEN_NODES}  ($((NUM_GEN_NODES * GPUS_PER_NODE)) GPUs)"
 echo "    Gym:       ${NUM_GYM_NODES}  ($((NUM_GYM_NODES * GPUS_PER_NODE)) GPUs)"
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
-echo "    Hetgroup 1: ${NUM_EXTERNAL_SERVICE_NODES} external GenRM nodes  (segment=${GENRM_SEGMENT_SIZE})"
+echo "    Hetgroup 1: ${NUM_EXTERNAL_SERVICE_NODES} external-service nodes  (segment=${GENRM_SEGMENT_SIZE})"
 echo "      GenRM:    ${GENRM_REPLICAS} independent TP=${GENRM_TENSOR_PARALLEL_SIZE}, DP=1 servers; LB port=${GENRM_LB_PORT}"
+echo "      NL2Bash:  ${NL2BASH_REPLICAS} independent TP=${NL2BASH_TENSOR_PARALLEL_SIZE}, DP=1 servers; LB port=${NL2BASH_LB_PORT}"
 fi
 echo "  Walltime:    ${WALLTIME}"
 echo "  Batch script: ${BATCH_SCRIPT}"
