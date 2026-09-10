@@ -44,6 +44,8 @@ from nemo_rl.experience.failures import (
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_RESERVED_KEY_PREFIX,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -915,11 +917,28 @@ class AsyncNemoGymRolloutImpl:
         )
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
+        # Every row of a group carries the SAME cohort identity, because the judge
+        # buffers responses by it: rows sharing an identity are scored as one group,
+        # so a re-dispatch of a subset must match its siblings when it belongs to
+        # their cohort and differ when it does not.
+        group_id = template_row.get(NEMO_GYM_GROUP_ID_KEY) or uuid.uuid4().hex
+        group_attempt = template_row.get(NEMO_GYM_GROUP_ATTEMPT_KEY, 0)
+        # bool is an int subclass, and True would silently key a second cohort.
+        if (
+            not isinstance(group_attempt, int)
+            or isinstance(group_attempt, bool)
+            or group_attempt < 0
+        ):
+            raise ValueError(
+                f"{NEMO_GYM_GROUP_ATTEMPT_KEY} must be a non-negative integer"
+            )
         rows = []
         for i in range(self._num_generations_per_prompt):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
+            row[NEMO_GYM_GROUP_ID_KEY] = group_id
+            row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
             rows.append(row)
         return rows
 
@@ -1416,6 +1435,39 @@ class RolloutManager:
         data_attempts = 0
         last_infra_error: Optional[Exception] = None
 
+        # Cohort identity for the judge, held OUTSIDE the loop so it survives a
+        # retry: the group id has to stay stable for a cohort to form at all, while
+        # the attempt has to advance so a re-dispatch of a subset cannot rejoin the
+        # cohort its siblings already filled. This is NOT the TQ group reserved per
+        # attempt below -- that one exists so a failed attempt's data-plane rows
+        # cannot collide with the retry's, and is deliberately not stable.
+        #
+        # lineage_group_id takes precedence when the ledger minted one, since it is
+        # already this prompt's durable logical identity across attempts, which is
+        # exactly what the cohort key needs.
+        logical_group_id: Optional[str] = None
+        group_attempt = 0
+        extra_env_info = input_sample.get("extra_env_info")
+        if isinstance(extra_env_info, dict):
+            configured_group_id = extra_env_info.get(NEMO_GYM_GROUP_ID_KEY)
+            if configured_group_id is not None and (
+                not isinstance(configured_group_id, str) or not configured_group_id
+            ):
+                raise ValueError(f"{NEMO_GYM_GROUP_ID_KEY} must be a non-empty string")
+            logical_group_id = (
+                lineage_group_id or configured_group_id or uuid.uuid4().hex
+            )
+            configured_group_attempt = extra_env_info.get(NEMO_GYM_GROUP_ATTEMPT_KEY, 0)
+            if (
+                not isinstance(configured_group_attempt, int)
+                or isinstance(configured_group_attempt, bool)
+                or configured_group_attempt < 0
+            ):
+                raise ValueError(
+                    f"{NEMO_GYM_GROUP_ATTEMPT_KEY} must be a non-negative integer"
+                )
+            group_attempt = configured_group_attempt
+
         # The loop condition is the infrastructure budget, so running out of it exits
         # here rather than raising from inside the handler. The data budget is tracked
         # separately and terminates from within, since exhausting it is a statement
@@ -1439,8 +1491,19 @@ class RolloutManager:
                     inflight_registry[group_id] = (current_task, start_version)
                 # Unregister before commit so cancellation cannot interrupt it.
                 try:
+                    # Copied rather than mutated in place: input_sample belongs to the
+                    # caller and outlives the loop, so stamping it would leak this
+                    # attempt's counter into the next one and defeat the isolation.
+                    attempt_input_sample = input_sample
+                    if logical_group_id is not None:
+                        attempt_input_sample = copy.deepcopy(input_sample)
+                        attempt_extra_env_info = attempt_input_sample["extra_env_info"]
+                        attempt_extra_env_info[NEMO_GYM_GROUP_ID_KEY] = logical_group_id
+                        attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
+                            group_attempt
+                        )
                     record = await self.run_rollout(
-                        input_sample, rollout_group_id=group_id
+                        attempt_input_sample, rollout_group_id=group_id
                     )
                 finally:
                     if inflight_registry is not None:
@@ -1491,6 +1554,7 @@ class RolloutManager:
                     # The backpressure permit is held across this sleep, so the wait is
                     # capped by max_backoff_s rather than growing without bound.
                     await asyncio.sleep(policy.backoff_for(infra_attempts))
+                    group_attempt += 1
                     continue
 
                 data_attempts += 1
@@ -1522,6 +1586,7 @@ class RolloutManager:
                 # documented above as the sign the fleet is degrading -- climb for bad
                 # data, which is the one distinction the two budgets exist to draw.
                 self._stats.record_data_retry(reason)
+                group_attempt += 1
                 continue
             except BaseException:
                 # Cancellation and other non-Exception exits: clean up, never retry.

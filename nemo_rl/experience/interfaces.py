@@ -23,6 +23,15 @@ from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 NEMO_GYM_RESERVED_KEY_PREFIX = "_ng_"
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# These two together key the judge-side cohort buffer, which accumulates one
+# response per logical rollout slot before scoring the group. Without the
+# attempt counter a retry that re-sends only SOME rows of a group joins the
+# original cohort and pushes it past num_rollouts_per_prompt, which genrm_compare
+# reports as a cohort-level failure and which used to be a bare assert. The
+# group id must stay stable across attempts for the cohort to form at all, so
+# the two have to travel together: stable identity plus a changing attempt.
+NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
+NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.

@@ -1,0 +1,42 @@
+# =============================================================================
+# Nemotron 3.5 Nano — Amplified Dolphin RLVR, all-features arm, Slurm judges
+# =============================================================================
+# Control arm for the NVCF comparison. Identical to rlvr_sc_nvcf_disagg.yaml in
+# every respect except WHERE THE THREE JUDGES RUN: on the allocation here,
+# on NVCF there. Everything a throughput number depends on otherwise -- model,
+# parallelism, batch shape, sequence length, Gym blend, sampler, data plane,
+# refit -- is inherited through the same parents, so a step-time delta between
+# the two arms is attributable to judge placement and nothing else.
+#
+# This is exactly the arrangement rlvr_sc_nvcf_disagg.yaml's own header
+# prescribes: the same defaults with nvcf_judges.yaml dropped. The local judge
+# settings live in rlvr.yaml and are never touched by that overlay, so they come
+# back intact rather than needing to be restated.
+#
+# Ordering in `defaults` remains load-bearing. readyfirst_cpu_rdma.yaml REPLACES
+# async_rl rather than merging into it, so it has to stay last; putting it first
+# would silently discard the streaming settings rlvr_sc.yaml contributes.
+#
+# THE JUDGE SHAPES ARE NOT INHERITED UNCHANGED. rlvr.yaml sizes the two
+# gym-resident judges for a standalone 86-node run (nl2bash TP4xDP4, safety
+# TP4xDP2). This arm instead matches the NVCF deployment replica-for-replica and
+# GPU-for-GPU, which is a different shape, and those overrides are passed on the
+# command line by submit_control_slurm_judges.sh rather than written here.
+#
+# That split is deliberate. Overriding vllm_serve_kwargs in YAML risks replacing
+# the whole mapping and taking attention_backend, gpu_memory_utilization and
+# max_model_len with it; a dotted command-line override sets one leaf and leaves
+# its siblings alone, and it is visible in the printed TRAIN_CMD at submit time.
+# Given how much of this campaign has been lost to config keys that parsed and
+# then did nothing, being able to read the value back off the command matters
+# more than keeping it in the file.
+#
+# Sandboxes are colocated on both arms and are environment-only, so nothing
+# sandbox-related appears here or in rlvr_sc_nvcf_disagg.yaml.
+#
+# Entrypoint: examples/run_grpo_single_controller.py, via nano35_launch.sh with
+# HOSTED_JUDGES=0 (its default). 82 nodes: 32 train + 32 gen + 6 gym + 12 GenRM.
+# =============================================================================
+defaults:
+  - rlvr_sc.yaml
+  - readyfirst_cpu_rdma.yaml

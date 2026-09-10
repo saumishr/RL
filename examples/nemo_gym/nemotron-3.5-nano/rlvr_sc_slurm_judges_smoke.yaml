@@ -1,0 +1,80 @@
+# =============================================================================
+# Nemotron 3.5 Nano — Slurm-judge control arm at 10 nodes, for smoke testing only
+# =============================================================================
+# The 82-node control arm with the batch shape shrunk to the smallest one that
+# still exercises the leg. Sibling of rlvr_sc_nvcf_disagg_smoke.yaml, which does
+# the same job for the NVCF arm, and the batch deltas below are copied from it
+# verbatim so the two smokes differ only in where the judges run.
+#
+# Not a training recipe: two steps at 8 prompts converges nothing.
+#
+# WHY THIS CANNOT BE 8 NODES LIKE THE NVCF SMOKE. That smoke gets its judges for
+# free -- they are hosted off the allocation, so 4 train + 2 gen + 2 gym is the
+# whole cost. This arm serves all three judges ITSELF, and two of them have a
+# hard floor:
+#
+#   GenRM     Nemotron-3-Ultra-550B-A55B at bf16 is ~1.1 TB of weights. TP8 puts
+#             ~137 GB on each 288 GB card; TP4 would need ~275 GB against a
+#             gpu_memory_utilization ceiling of ~274 GB, so it does not fit.
+#             TP8 is therefore the floor, and at 4 GPUs/node that is 2 nodes for
+#             a single replica.
+#   nl2bash   Qwen3-235B FP8, ~235 GB. TP2 is the shape the full arm uses.
+#   safety    4B. TP1.
+#
+# So the minimum is 4 train + 2 gen + gym + 2 GenRM. One gym node would hold both
+# gym-resident judges (2 GPUs + 1 GPU of 4), but 4 + 2 + 1 = 7 is odd and
+# nano35_launch.sh requires the Ray total to divide by SEGMENT_SIZE=2 -- the same
+# parity rule that forces the full arm to 6 gym nodes. Hence 2 gym nodes, an
+# 8-node Ray group, and 10 nodes overall.
+#
+# WHAT THIS PROVES, AND WHAT IT DOES NOT. Every judge runs at ONE replica here,
+# so it does not test the replication or the load balancer spread that the full
+# arm exists to measure. What it does test is the leg itself, which is where the
+# unknowns are:
+#
+#   * Qwen3-235B actually loads and serves at TP2. The full arm halves TP from
+#     rlvr.yaml's 4 to match NVCF, and nothing has run that shape on this
+#     cluster. A too-small TP fails at KV-cache allocation, AFTER the model
+#     loads -- late enough to waste an 82-node allocation.
+#   * The 4B safety judge serves at TP1.
+#   * GenRM comes up on-allocation behind its load balancer, rather than at an
+#     NVCF endpoint.
+#   * nano35_launch.sh drives the SingleController entrypoint rather than
+#     silently falling back to the V1 driver.
+#
+# Launched by submit_control_slurm_judges_smoke.sh, which sets the node counts
+# and the one-replica judge overrides.
+# =============================================================================
+defaults:
+  - rlvr_sc_slurm_judges.yaml
+
+# =============================================================================
+# Batch shape — identical to rlvr_sc_nvcf_disagg_smoke.yaml
+# =============================================================================
+# 8 prompts x 16 generations = 128 sequences, holding the parent's identity
+# train_global_batch_size = num_prompts_per_step * num_generations_per_prompt.
+# Two steps: one to refit from, one to train on refit weights, which is the
+# minimum that exercises nccl_reshard rather than just startup.
+# =============================================================================
+grpo:
+  num_prompts_per_step: 8
+  max_num_steps: 2
+
+policy:
+  train_global_batch_size: 128
+
+# =============================================================================
+# Streaming and backpressure, rescaled to the smaller cohort
+# =============================================================================
+# Merged into the parent's async_rl rather than overriding it: the sampler block
+# and the drop budget must survive from readyfirst_cpu_rdma.yaml. Do NOT add
+# _override_ here -- it would drop ready_first back to the inherited sampler.
+#
+# max_buffered_rollouts is at ready_first's hard floor of
+# num_prompts_per_step * (max_staleness_versions + 1) = 8 * 2 = 16. Below it the
+# rollout pump deadlocks waiting for buffer slots, and validation says so.
+# =============================================================================
+async_rl:
+  min_groups_for_streaming_train: 2
+  max_inflight_prompts: 16
+  max_buffered_rollouts: 16
