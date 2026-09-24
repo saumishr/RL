@@ -635,9 +635,55 @@ TOPO_PROBE_EOF
 # head script, so the head can gate the driver on sandbox readiness. Arbitrary
 # extra mounts are supported via SANDBOX_EXTRA_MOUNTS (e.g. a shared temp dir).
 SANDBOX_PORTS_DIR=""
+# How many of the N sandbox instances must come up before the driver may start.
+# Unset means all of them, which is the historical behaviour. Lowering it buys
+# tolerance to per-node startup failures that are not the node's fault: nginx
+# resolves its upstream at config-parse time, so a single transient DNS miss on
+# the master hostname aborts that task, and at 1400+ nodes resolving the same
+# name at once a couple of misses per job is routine. Jobs 840506 and 840610
+# each lost every node to exactly two such misses.
+#
+# The master is exempt from the tolerance and checked separately below. Every
+# other node is only a proxy to it, so losing a proxy costs that node's share of
+# sandbox capacity, but losing the master silently breaks all of them: the
+# readiness probe is a local TCP accept that succeeds whether or not the master
+# exists, and Sandbox._send_request turns the resulting 502 into a timeout that
+# reads as a rollout failure rather than an infrastructure one.
+SANDBOX_MIN_READY=0
+SANDBOX_MASTER_NODE=""
+# 600s was sized for small allocations. At 1400+ nodes a healthy cluster needs
+# 9-10 minutes just to bring every uWSGI tier up, so the old default left almost
+# no margin and would read ordinary slowness as failure -- especially now that
+# falling short of the gate is survivable rather than fatal.
+SANDBOX_READY_TIMEOUT="${SANDBOX_READY_TIMEOUT:-600}"
+# Per-task budget, distinct from the cluster-wide gate above. Proxies reach their
+# local port in a couple of minutes, but the master must first collect every
+# node's port file and then emit one nginx upstream entry per remote worker --
+# nodes x workers-per-node entries, built in a bash loop and then parsed by
+# nginx. At 1424 nodes and 144 workers that is over 200k servers, and job 840893
+# died here: the master had all its port reports in hand and was still writing
+# the upstream when this deadline cut it off. Keep it below
+# SANDBOX_READY_TIMEOUT so the cluster gate, not this timer, decides the job's
+# fate.
+SANDBOX_TASK_READY_TIMEOUT="${SANDBOX_TASK_READY_TIMEOUT:-300}"
 if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   SANDBOX_PORTS_DIR="$LOG_DIR/sandbox"
   mkdir -p "$SANDBOX_PORTS_DIR"
+  # Same election the sandbox container performs: first host of the nodelist in
+  # allocation order, which is NOT nodes_array -- that has been sorted by now.
+  #
+  # Reuse the already-expanded $nodes rather than piping scontrol into head. At
+  # 1400+ nodes head closes the pipe before scontrol finishes writing, scontrol
+  # dies of SIGPIPE, and under `set -o pipefail` the assignment returns 141 and
+  # `set -e` kills the job at +24s. The pipe at SLURM_MASTER_NODE below survives
+  # the same race only because `export VAR=$(...)` masks the exit status.
+  _unsorted_nodes=($nodes)
+  SANDBOX_MASTER_NODE="${_unsorted_nodes[0]}"
+  unset _unsorted_nodes
+  SANDBOX_MIN_READY=$(awk -v n="$SLURM_JOB_NUM_NODES" \
+                          -v f="${SANDBOX_MIN_READY_FRACTION:-1.0}" \
+    'BEGIN { m = int(n * f); if (m < n * f) m++; if (m < 1) m = 1; if (m > n) m = n; print m }')
+  echo "[INFO] Sandbox gate: >= $SANDBOX_MIN_READY/$SLURM_JOB_NUM_NODES ready, master $SANDBOX_MASTER_NODE required"
 fi
 
 # First we start the head of the ray cluster on one of the physical nodes
@@ -824,7 +870,7 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   # first, so a stuck sandbox fails at 10 min instead of only after the 30-min
   # worker wait.
   WORKER_DEADLINE=\$((SECONDS + 1800))
-  SANDBOX_DEADLINE=\$((SECONDS + 600))
+  SANDBOX_DEADLINE=\$((SECONDS + $SANDBOX_READY_TIMEOUT))
   workers_ready=0
   # Each sandbox task touches SANDBOX_READY_<hostname> when its port comes up (see
   # the sandbox srun below). With no sandbox configured, count it ready up front.
@@ -850,9 +896,15 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
       break
     fi
     if [[ "\$sandbox_ready" -eq 0 ]] && (( SECONDS > SANDBOX_DEADLINE )); then
-      echo "[ERROR] Timed out waiting for sandbox (\$ready_count/$SLURM_JOB_NUM_NODES after 10 min)"
-      touch "$LOG_DIR/ENDED"
-      exit 1
+      if [[ "\$ready_count" -ge "$SANDBOX_MIN_READY" ]] && \
+         [[ -f "$SANDBOX_PORTS_DIR/SANDBOX_READY_$SANDBOX_MASTER_NODE" ]]; then
+        echo "[WARN][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Sandbox degraded: \$ready_count/$SLURM_JOB_NUM_NODES ready after ${SANDBOX_READY_TIMEOUT}s, at or above the $SANDBOX_MIN_READY minimum and the master $SANDBOX_MASTER_NODE is up. Proceeding with reduced sandbox capacity."
+        sandbox_ready=1
+      else
+        echo "[ERROR] Timed out waiting for sandbox (\$ready_count/$SLURM_JOB_NUM_NODES after ${SANDBOX_READY_TIMEOUT}s; need >= $SANDBOX_MIN_READY and master $SANDBOX_MASTER_NODE)"
+        touch "$LOG_DIR/ENDED"
+        exit 1
+      fi
     fi
     if [[ "\$workers_ready" -eq 0 ]] && (( SECONDS > WORKER_DEADLINE )); then
       echo "[ERROR] Timed out waiting for all workers to connect (\$worker_units/$NUM_ACTORS after 30 min)"
@@ -1045,6 +1097,35 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     SANDBOX_EXPORTS="${SANDBOX_EXPORTS},${SANDBOX_ENV_VARS}"
   fi
 
+  # start-with-nginx.sh elects the cluster-wide nginx load balancer as the first
+  # host in SLURM_JOB_NODELIST -- the JOB's nodes -- while this srun decides which
+  # nodes actually run a sandbox. Two components, two different sources. Point the
+  # election at the step so the master is always a node that has a sandbox on it.
+  #
+  # Today this srun spans every node, so the job's first host does run one and the
+  # election happens to be correct. It stops being correct the moment anyone adds
+  # --exclude="$head_node" here (or sizes the step at N-1), because the elected
+  # master is then the one machine deliberately skipped. Every other node comes up
+  # as a proxy pointing at it and every /execute returns 502 -- the mode that made
+  # all 12,723 code executions in job 5566575 fail for three hours with zero 200s.
+  #
+  # Nothing detects that: the per-node readiness probe is a TCP accept against the
+  # node's own proxy, which binds whether or not its master exists, and
+  # Sandbox._send_request converts a 502 into httpx.TimeoutException, so the
+  # rollout reports "Client timed out" and the reward is silently wrong rather
+  # than the job failing. Hence :? -- fail loudly if srun ever stops setting it,
+  # rather than falling back to the job scope and reintroducing the bug quietly.
+  SANDBOX_COMMAND="export SLURM_JOB_NODELIST=\${SLURM_STEP_NODELIST:?sandbox requires SLURM_STEP_NODELIST}; $SANDBOX_COMMAND"
+
+  # Fail-fast stays on when every node is required, so a dead sandbox still
+  # aborts immediately rather than burning the full 10-minute gate. Once a
+  # tolerance is configured the gate is the arbiter instead, and one task's exit
+  # must not take the whole step -- and with it the job -- down.
+  SANDBOX_KILL_ON_BAD_EXIT="--kill-on-bad-exit=1"
+  if (( SANDBOX_MIN_READY < SLURM_JOB_NUM_NODES )); then
+    SANDBOX_KILL_ON_BAD_EXIT=""
+  fi
+
   echo "[INFO] Starting sandbox sidecars on all allocated nodes (ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT, base_port=$SANDBOX_BASE_PORT)..."
   srun --output "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
     --error "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
@@ -1055,7 +1136,7 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     -A "$SLURM_JOB_ACCOUNT" \
     -p "$SLURM_JOB_PARTITION" \
     --wait=60 \
-    --kill-on-bad-exit=1 \
+    ${SANDBOX_KILL_ON_BAD_EXIT} \
     --overlap \
     --nodes="$SLURM_JOB_NUM_NODES" \
     --ntasks-per-node=1 \
@@ -1063,14 +1144,14 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     bash -xc '
       ('"$SANDBOX_COMMAND"') &
       SANDBOX_PID=$!
-      deadline=$((SECONDS + 300))
+      deadline=$((SECONDS + '"$SANDBOX_TASK_READY_TIMEOUT"'))
       while ! (echo > /dev/tcp/localhost/'"$SANDBOX_PORT"') 2>/dev/null; do
         if ! kill -0 $SANDBOX_PID 2>/dev/null; then
           echo "[ERROR] Sandbox process died before becoming ready on $(hostname)"
           exit 1
         fi
         if (( SECONDS > deadline )); then
-          echo "[ERROR] Sandbox not ready on $(hostname) after 5 min"
+          echo "[ERROR] Sandbox not ready on $(hostname) after '"$SANDBOX_TASK_READY_TIMEOUT"'s"
           exit 1
         fi
         sleep 2
