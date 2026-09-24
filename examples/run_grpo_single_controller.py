@@ -73,6 +73,24 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
+def _controller_placement() -> dict[str, Any]:
+    """Pin the controller to the dedicated Ray head when the cluster has one.
+
+    The controller's host-memory peak is set by cohort postprocessing, which is
+    fixed by the batch shape rather than by cluster size, so sharing a node with
+    GPU workers puts it a few hundred GB from the kernel OOM killer. ray.sub's
+    DEDICATED_RAY_HEAD=1 reserves exactly one compute-free node and advertises it
+    as `ray_head`. Read the live cluster rather than the env var so a mismatch
+    between launcher and allocation cannot silently pin nothing.
+
+    Claim the whole unit, not a fraction: the point is that nothing else lands
+    on this node.
+    """
+    if ray.cluster_resources().get("ray_head", 0) >= 1:
+        return {"resources": {"ray_head": 1}}
+    return {}
+
+
 def main() -> None:
     """Main entry point."""
     register_omegaconf_resolvers()
@@ -155,8 +173,9 @@ def main() -> None:
         config, tokenizer, processor=processor
     )
 
-    print("🚀 Launching SingleControllerActor")
-    sc = SingleControllerActor.remote(
+    placement = _controller_placement()
+    print(f"🚀 Launching SingleControllerActor (placement={placement or 'default'})")
+    sc = SingleControllerActor.options(**placement).remote(
         master_config=config,
         actor_args=actor_args,
         setup_timing_metrics=setup_timing_metrics,
