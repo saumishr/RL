@@ -201,6 +201,50 @@ class AdvantageRequest:
     trainer_version: int
 
 
+def split_meta_by_prompt_group(
+    meta: KVBatchMeta, num_shards: int, group_size: int
+) -> Optional[list[KVBatchMeta]]:
+    """Split ``meta`` into at most ``num_shards`` metas of whole prompt groups.
+
+    The group-relative estimators are only valid on complete prompt groups, so
+    a split that cut one would corrupt the baseline silently instead of
+    raising. This returns ``None`` -- meaning "do not shard" -- whenever the
+    group layout cannot be established, and the caller falls back to one
+    whole-batch call.
+
+    Boundaries come from ``group_size`` (``num_generations_per_prompt``), since
+    every chunk reaching this stage holds whole groups laid out contiguously.
+    An earlier version read them from ``DATASET_SOURCE_TAG`` instead, which
+    ``TQReplayBuffer.commit`` only stamps when the dataset row carries a
+    ``dataset`` key; on a dataset without one the tag is absent, every split
+    declined, and the fallback was silent enough that a whole 256-node run
+    measured nothing. A row count that is not a whole multiple of
+    ``group_size`` means the layout is not what this assumes, so it declines
+    rather than cutting blind.
+
+    Chunks are contiguous, so concatenating the shards reproduces the original
+    row order and the caller never has to rebuild a permutation.
+    """
+    if num_shards <= 1 or group_size <= 0:
+        return None
+    num_rows = len(meta.sample_ids)
+    if num_rows % group_size != 0:
+        return None
+    num_groups = num_rows // group_size
+    if num_groups < 2:
+        return None
+    # Groups carry a fixed number of generations, so equal group counts are
+    # already equal row counts; balancing by tokens would cost the
+    # order-preserving property for a second-order gain.
+    groups_per_shard = -(-num_groups // num_shards)
+    rows_per_shard = groups_per_shard * group_size
+    shards = [
+        meta.slice(begin, min(begin + rows_per_shard, num_rows))
+        for begin in range(0, num_rows, rows_per_shard)
+    ]
+    return shards if len(shards) > 1 else None
+
+
 @dataclass(frozen=True)
 class AdvantageOutcome:
     """One call's results, every one of them already reduced to metadata.

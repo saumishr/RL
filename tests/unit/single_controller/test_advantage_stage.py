@@ -21,6 +21,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageRequest,
     AdvantageStageConfig,
     ImportanceSamplingDiagnosticsOptions,
+    split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.utils import (
@@ -151,3 +152,70 @@ class TestImportanceSamplingDiagnosticsOptions:
         assert accumulator.truncated_importance_sampling_type == "seq-mask-tis"
         # Fresh per call, so it contributes nothing until something is recorded.
         assert accumulator.flush() == ({}, [])
+
+
+def _grouped_meta(num_groups: int, per_group: int) -> KVBatchMeta:
+    """Rows for ``num_groups`` contiguous prompt groups.
+
+    Tags carry no ``dataset_source``, matching a dataset whose rows have no
+    ``dataset`` key -- the case that made the tag-keyed splitter decline every
+    time.
+    """
+    total = num_groups * per_group
+    return KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(total)],
+        fields=["total_reward"],
+        sequence_lengths=[8] * total,
+        tags=[{"weight_version": 1} for _ in range(total)],
+    )
+
+
+class TestSplitMetaByPromptGroup:
+    def test_shards_cover_every_row_in_original_order(self):
+        meta = _grouped_meta(num_groups=8, per_group=4)
+        shards = split_meta_by_prompt_group(meta, 4, 4)
+        assert shards is not None and len(shards) == 4
+        rejoined = [sid for shard in shards for sid in shard.sample_ids]
+        assert rejoined == meta.sample_ids
+        # Per-sample sidecars travel with the rows they describe.
+        assert [t for shard in shards for t in shard.tags] == meta.tags
+        assert [n for s in shards for n in s.sequence_lengths] == meta.sequence_lengths
+
+    def test_every_shard_holds_whole_groups(self):
+        meta = _grouped_meta(num_groups=8, per_group=4)
+        shards = split_meta_by_prompt_group(meta, 3, 4)
+        assert shards is not None
+        assert all(len(shard.sample_ids) % 4 == 0 for shard in shards)
+
+    def test_splits_without_any_dataset_source_tag(self):
+        """Regression: the tag-keyed version declined here and measured nothing."""
+        meta = _grouped_meta(num_groups=2048, per_group=16)
+        shards = split_meta_by_prompt_group(meta, 8, 16)
+        assert shards is not None
+        assert [len(shard.sample_ids) for shard in shards] == [4096] * 8
+
+    def test_never_returns_more_shards_than_requested(self):
+        meta = _grouped_meta(num_groups=7, per_group=2)
+        shards = split_meta_by_prompt_group(meta, 4, 2)
+        assert shards is not None and len(shards) <= 4
+        assert [s for sh in shards for s in sh.sample_ids] == meta.sample_ids
+
+    def test_declines_when_groups_are_fewer_than_two(self):
+        assert split_meta_by_prompt_group(_grouped_meta(1, 16), 8, 16) is None
+
+    def test_declines_without_a_pool_to_spread_across(self):
+        meta = _grouped_meta(num_groups=8, per_group=4)
+        assert split_meta_by_prompt_group(meta, 1, 4) is None
+        assert split_meta_by_prompt_group(meta, 0, 4) is None
+
+    def test_declines_on_a_partial_group(self):
+        """A row count that is not a whole multiple of the group size is not
+        the layout this assumes, so it must not cut blind."""
+        meta = _grouped_meta(num_groups=8, per_group=4)
+        assert split_meta_by_prompt_group(meta.slice(0, 30), 4, 4) is None
+
+    def test_declines_on_a_nonsense_group_size(self):
+        meta = _grouped_meta(num_groups=8, per_group=4)
+        assert split_meta_by_prompt_group(meta, 4, 0) is None

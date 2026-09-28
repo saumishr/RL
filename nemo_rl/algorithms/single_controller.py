@@ -126,6 +126,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageOutcome,
     AdvantageRequest,
     AdvantageStageConfig,
+    split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
@@ -5090,21 +5091,56 @@ class SingleControllerActor:
         if self._advantage_estimator is None:
             return meta, True
 
-        request = AdvantageRequest(
-            meta=meta,
-            step=self._train_steps + 1,
-            trainer_version=self._trainer_version,
+        # One call hands a single actor the whole batch, which leaves the rest
+        # of the pool idle for the duration. Splitting on prompt-group
+        # boundaries keeps every shard valid for the group-relative estimators
+        # while letting the pool work the step in parallel; the split declines
+        # itself whenever the group layout is not recoverable from metadata.
+        shards = split_meta_by_prompt_group(
+            meta,
+            len(self._advantage_actors),
+            self._algo_cfg.num_generations_per_prompt,
         )
+        # Say which path was taken. The split declines itself on anything it
+        # cannot prove, and an unlogged decline is indistinguishable from a
+        # shard that bought nothing -- which is how one 256-node run was spent
+        # measuring a no-op.
+        log.info(
+            "advantage stage: %d row(s) over %d shard(s), pool=%d",
+            len(meta.sample_ids),
+            len(shards) if shards is not None else 1,
+            len(self._advantage_actors),
+        )
+        requests = [
+            AdvantageRequest(
+                meta=shard,
+                step=self._train_steps + 1,
+                trainer_version=self._trainer_version,
+            )
+            for shard in (shards if shards is not None else [meta])
+        ]
         # The writeback and the metadata the controller derives from it have to
         # land in one mutation cut, so a snapshot cannot capture the advantages
         # without the replay-index state that describes them. Holding the cut
-        # across the remote call deliberately makes checkpoint acquisition wait
-        # for the tail of an in-flight advantage RPC, exactly as group_commits
+        # across the remote calls deliberately makes checkpoint acquisition wait
+        # for the tail of every in-flight advantage RPC, exactly as group_commits
         # already does for the finalizer.
         async with self._data_plane_checkpoint_barrier.mutation("advantage_writeback"):
-            outcome = await self._run_advantage_stage(request)
-        self._absorb_advantage_outcome(outcome)
-        return outcome.meta, outcome.has_valid_training_tokens
+            outcomes = await asyncio.gather(
+                *(self._run_advantage_stage(request) for request in requests)
+            )
+        # Every reduction downstream of here is already per-call: the partials
+        # and OPD moments are contributions rather than totals, and the
+        # sequence-error metrics reduce count-weighted across records.
+        new_fields: list[str] = []
+        has_valid_training_tokens = False
+        for outcome in outcomes:
+            self._absorb_advantage_outcome(outcome)
+            new_fields.extend(outcome.meta.fields or [])
+            has_valid_training_tokens |= outcome.has_valid_training_tokens
+        # Shards only ever add field names, never touch per-sample rows, so the
+        # full-batch meta carrying the union of those names is the whole result.
+        return meta.with_fields(new_fields), has_valid_training_tokens
 
     async def _run_advantage_stage(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one advantage stage on the pool, or in-process without one."""
