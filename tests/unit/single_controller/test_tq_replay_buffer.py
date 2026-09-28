@@ -693,14 +693,18 @@ class TestTQReplayBufferReserveCommit:
         # to "unknown" because the stub record carries neither an agent_ref nor
         # a task_name. dataset_source / pass_rate are absent -- the stub record
         # has no extra_env_info.
-        assert meta.tags == [
-            {
-                "weight_version": 3,
-                "prompt_idx": 418,
-                "rollout_environment": "unknown",
-                "staleness": 1,
-            }
-        ] * _N_GENS
+        assert (
+            meta.tags
+            == [
+                {
+                    "weight_version": 3,
+                    "prompt_idx": 418,
+                    "rollout_environment": "unknown",
+                    "staleness": 1,
+                }
+            ]
+            * _N_GENS
+        )
         assert len(dp.put_calls) == 1
         assert len(trace_calls) == 1
         assert trace_calls[0]["keys"] == meta.sample_ids

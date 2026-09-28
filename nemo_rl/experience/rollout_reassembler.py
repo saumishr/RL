@@ -90,6 +90,11 @@ class FinalizedGroup:
     group_max_wv: int
     staging_keys: list[str]
     canonical_output_tokens: int = 0
+    # Longest single row in the group. A group commits only when all of its
+    # rows land, so group latency tracks this maximum rather than the mean
+    # canonical_output_tokens/n -- which is what makes a mean useless for
+    # deciding whether one runaway generation is gating the group.
+    max_row_output_tokens: int = 0
     metrics: dict[str, float] = field(default_factory=dict)
     # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
@@ -636,14 +641,16 @@ class RolloutReassembler:
             sequence_lengths=[int(s) for s in lengths.tolist()],
             tags=[dict(t) for t in tags],
         )
+        row_output_tokens = [
+            sum(int(mask) for mask in row.token_mask) for row in valid_rows
+        ]
         return FinalizedGroup(
             meta=meta,
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
-            canonical_output_tokens=sum(
-                int(mask) for row in valid_rows for mask in row.token_mask
-            ),
+            canonical_output_tokens=sum(row_output_tokens),
+            max_row_output_tokens=max(row_output_tokens, default=0),
             metrics=metrics,
             valid_row_count=len(valid_rows),
             total_row_count=len(rows),

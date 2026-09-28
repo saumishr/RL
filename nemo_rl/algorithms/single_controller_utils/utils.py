@@ -118,6 +118,34 @@ class _ImportanceSamplingCohort:
             )
         ]
 
+    def merge(self, other: _ImportanceSamplingCohort) -> None:
+        """Fold another bucket's counts in, as if both had been observed here."""
+        self.num_sequences += other.num_sequences
+        self.num_retained += other.num_retained
+        self.num_masked_finite += other.num_masked_finite
+        self.num_masked_total += other.num_masked_total
+        self.num_nonfinite += other.num_nonfinite
+        self.retained_ei_sum += other.retained_ei_sum
+        self.retained_reward_sum += other.retained_reward_sum
+        self.retained_ei_histogram = [
+            mine + theirs
+            for mine, theirs in zip(
+                self.retained_ei_histogram, other.retained_ei_histogram
+            )
+        ]
+        for group_id, (first_reward, mixed) in other._group_rewards.items():
+            mine = self._group_rewards.get(group_id)
+            if mine is None:
+                self._group_rewards[group_id] = (first_reward, mixed)
+                continue
+            # "Mixed" means some reward differed from the first one observed.
+            # Keeping this side's first and testing the other side's against it
+            # reproduces what a single sequential pass would have concluded.
+            self._group_rewards[group_id] = (
+                mine[0],
+                mine[1] or mixed or first_reward != mine[0],
+            )
+
     def as_dict(self) -> dict[str, Any]:
         num_groups = len(self._group_rewards)
         num_mixed_groups = sum(mixed for _, mixed in self._group_rewards.values())
@@ -153,6 +181,12 @@ class _ImportanceSamplingLagSummary:
         default_factory=_ImportanceSamplingCohort
     )
     other: _ImportanceSamplingCohort = field(default_factory=_ImportanceSamplingCohort)
+
+    def merge(self, summary: _ImportanceSamplingLagSummary) -> None:
+        """Fold another lag summary in cohort by cohort."""
+        self.all.merge(summary.all)
+        self.ifbench_direct.merge(summary.ifbench_direct)
+        self.other.merge(summary.other)
 
 
 @dataclass
@@ -407,6 +441,28 @@ class ImportanceSamplingDiagnosticsAccumulator:
             ],
         }
 
+    def merge(self, other: ImportanceSamplingDiagnosticsAccumulator) -> None:
+        """Fold a partial recorded elsewhere into this step's accumulation.
+
+        The advantage stage runs in its own actor, so each call records into a
+        fresh accumulator over there and the controller merges the results.
+        Every field is either a count, a sum, or a bounded top-K, so the merged
+        state matches what one sequential accumulator would hold.
+        """
+        if other._step is None:
+            return
+        if self._step is not None and self._step != other._step:
+            raise ValueError("importance-sampling diagnostics mixed optimizer steps")
+        self._step = other._step
+        for lag, summary in other._summaries_by_lag.items():
+            mine = self._summaries_by_lag.get(lag)
+            if mine is None:
+                self._summaries_by_lag[lag] = summary
+            else:
+                mine.merge(summary)
+        for (lag, is_ifbench_direct), rows in other._top_rows.items():
+            self._retain_top_rows(lag, is_ifbench_direct, rows)
+
     def flush(self) -> tuple[dict[str, float], list[dict[str, Any]]]:
         """Return step metrics and compact JSONL records, then reset."""
         if not self._summaries_by_lag:
@@ -518,12 +574,77 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
     return metrics
 
 
+@dataclass(frozen=True)
+class RewardPartial:
+    """One advantage-stage call's reward sums, already reduced.
+
+    Rewards are per-row rather than per-token, so holding the tensors was never
+    the bulk of the controller's memory. They are reduced here anyway because
+    the advantage stage is moving into its own actor, and the whole point of
+    that boundary is that nothing cohort-sized crosses it.
+    """
+
+    weighted_total: float
+    weight: float
+
+    @classmethod
+    def from_rows(
+        cls,
+        rewards: torch.Tensor,
+        sample_mask: torch.Tensor | None = None,
+    ) -> RewardPartial:
+        """Reduce one call's rewards, weighting by row validity when given.
+
+        An absent mask weights every row equally, so the merged result is the
+        plain mean and callers that never had a mask keep their old numbers.
+        """
+        flat = rewards.flatten()
+        if sample_mask is None:
+            return cls(
+                weighted_total=float(flat.sum(dtype=torch.float64)),
+                weight=float(flat.numel()),
+            )
+        mask = sample_mask.flatten().to(flat.dtype)
+        return cls(
+            weighted_total=float((flat * mask).sum(dtype=torch.float64)),
+            weight=float(mask.sum(dtype=torch.float64)),
+        )
+
+
+@dataclass(frozen=True)
+class AdvantagePartial:
+    """One advantage-stage call's token-masked advantage moments.
+
+    Replaces keeping ``torch.masked_select(advantages, mask)`` itself, which is
+    one float per trained token across the entire cohort, appended once per
+    streaming chunk and then concatenated at step close -- so the step's peak
+    was twice the accumulated size. Only the mean, min and max were ever read
+    off it, and all three merge from these four numbers.
+    """
+
+    count: int
+    total: float
+    minimum: float
+    maximum: float
+
+    @classmethod
+    def from_values(cls, values: torch.Tensor) -> AdvantagePartial:
+        """Reduce one call's masked advantages; an empty selection counts zero."""
+        if values.numel() == 0:
+            return cls(count=0, total=0.0, minimum=0.0, maximum=0.0)
+        return cls(
+            count=int(values.numel()),
+            total=float(values.sum(dtype=torch.float64)),
+            minimum=float(values.min()),
+            maximum=float(values.max()),
+        )
+
+
 def reduce_advantage_pump_metrics(
-    rewards: list[torch.Tensor],
-    masked_advantages: list[torch.Tensor],
+    reward_partials: list[RewardPartial],
+    advantage_partials: list[AdvantagePartial],
     sequence_lengths: list[int],
     *,
-    sample_masks: list[torch.Tensor] | None = None,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
     num_mask_sample_filtered: list[int] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
@@ -535,14 +656,14 @@ def reduce_advantage_pump_metrics(
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
     Args:
-        rewards: One tensor per advantage_stage call; each row a sample reward.
-        masked_advantages: Token-masked advantages, one tensor per call.
-        sequence_lengths: All input_lengths trained on this step.
-        sample_masks: Row validity for each ``rewards`` entry (token-capture
+        reward_partials: One record per advantage_stage call. Already weighted
+            by row validity when the caller had a sample mask (token-capture
             placeholders and mask_sample/overlong/seq-logprob-error rows carry
-            0). Weights ``reward`` so it averages over trained rows only,
-            matching what the advantage estimator's baseline already excludes.
-            None keeps the legacy unweighted mean.
+            0), so ``reward`` averages over trained rows only, matching what
+            the advantage estimator's baseline already excludes.
+        advantage_partials: One record per advantage_stage call, over that
+            call's token-masked advantages.
+        sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
         num_mask_sample_filtered: Environment-flagged sample counts, one per
@@ -562,24 +683,21 @@ def reduce_advantage_pump_metrics(
 
     """
     out: dict[str, float] = {}
-    if rewards:
-        cat_rewards = torch.cat([r.flatten() for r in rewards])
-        if sample_masks:
-            cat_masks = torch.cat([m.flatten() for m in sample_masks])
-            mask_sum = cat_masks.sum()
-            out["reward"] = (
-                float((cat_rewards * cat_masks).sum() / mask_sum)
-                if mask_sum > 0
-                else 0.0
-            )
-        else:
-            out["reward"] = float(cat_rewards.mean())
-    if masked_advantages:
-        cat = torch.cat([a.flatten() for a in masked_advantages])
-        if cat.numel() > 0:
-            out["advantages/mean"] = float(cat.mean())
-            out["advantages/max"] = float(cat.max())
-            out["advantages/min"] = float(cat.min())
+    if reward_partials:
+        weight = sum(partial.weight for partial in reward_partials)
+        out["reward"] = (
+            sum(partial.weighted_total for partial in reward_partials) / weight
+            if weight > 0
+            else 0.0
+        )
+    if advantage_partials:
+        # A call whose mask selected nothing carries no min or max to merge.
+        populated = [partial for partial in advantage_partials if partial.count]
+        if populated:
+            count = sum(partial.count for partial in populated)
+            out["advantages/mean"] = sum(partial.total for partial in populated) / count
+            out["advantages/max"] = max(partial.maximum for partial in populated)
+            out["advantages/min"] = min(partial.minimum for partial in populated)
         else:
             out["advantages/mean"] = 0.0
             out["advantages/max"] = 0.0

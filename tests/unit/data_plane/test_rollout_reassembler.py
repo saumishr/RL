@@ -229,6 +229,9 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     assert finalized.metrics["finalize/terminal_selection_declared_count"] == 0.0
     assert finalized.metrics["finalize/terminal_witness_disagreement_count"] == 0.0
     assert finalized.canonical_output_tokens == sum(expected.token_mask)
+    # One valid row, so the group total and its longest row coincide; the
+    # placeholder is excluded from both because it is not in valid_rows.
+    assert finalized.max_row_output_tokens == sum(expected.token_mask)
 
     rows = _fetch_rows(tq_client, rollout_ids)
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()

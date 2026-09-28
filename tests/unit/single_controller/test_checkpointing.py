@@ -796,6 +796,7 @@ def _make_actor_args(
         ),
         last_checkpoint_path=last_checkpoint_path,
         finalizer_actors=[],
+        advantage_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
@@ -1603,6 +1604,7 @@ class TestPeriodicRolloutCheckpoint:
             await actor._log_rollout_throughput_metrics(emit=False)
             actor._rollout_completion_durations_s.extend([2.0, 4.0])
             actor._rollout_queue_wait_durations_s.extend([1.0, 3.0])
+            actor._rollout_max_output_tokens.extend([1000, 5000])
             await actor._log_rollout_throughput_metrics()
 
         try:
@@ -1624,6 +1626,13 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["group_completion_seconds_p50"] == pytest.approx(2.0)
         assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
         assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)
+        assert logged["group_max_output_tokens_p50"] == pytest.approx(1000.0)
+        assert logged["group_max_output_tokens_p95"] == pytest.approx(5000.0)
+        assert logged["group_max_output_tokens_max"] == pytest.approx(5000.0)
+        # 20 tok/s across the 3 running sequences the same sample reported.
+        assert logged["generation_tokens_per_second_per_request"] == pytest.approx(
+            20.0 / 3.0
+        )
         assert "rollout_throughput_metrics=" not in capsys.readouterr().out
 
     @pytest.mark.parametrize(
