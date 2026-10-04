@@ -1,0 +1,37 @@
+# Pipeclean overlay for the mixed-teacher Super VL 3.5 recipe on the
+# SingleController path. Production parallelism is preserved exactly -- TP2/CP2/EP16
+# for training, TP4/EP4 for vLLM generation -- so this exercises the real parallel
+# layout rather than a reduced one. Only the step budget, the cohort size and the
+# generation node count shrink.
+#
+# Training stays at 16 nodes because TP2 * CP2 * EP16 = 64 GPUs is a hard floor at
+# 4 GPUs/node. Generation drops 16 -> 8 nodes, so cluster.num_nodes is 24.
+#
+# Sequence lengths are deliberately left at the production 65536. The mixed-teacher
+# blend carries 64-frame video and 64-image prompts; shortening the window would push
+# those past overlong_filtering and the run would train on a biased, mostly-text
+# remainder, which defeats the purpose of a pipeclean.
+#
+# Two constraints the SC split path enforces at config load:
+#   num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
+#   max_buffered_rollouts >= num_prompts_per_step * (max_lookahead_versions + 1)
+# With 32 prompts x 16 generations that fixes the batch at 512 and the floor at 64.
+defaults: ./super_vl_35_mixed_teachers_nv_main.yaml
+cluster:
+  num_nodes: 24
+grpo:
+  max_num_steps: 5
+  num_prompts_per_step: 32
+policy:
+  train_global_batch_size: 512
+  generation:
+    colocated:
+      resources:
+        num_nodes: 8
+async_rl:
+  max_inflight_prompts: 64
+  max_buffered_rollouts: 64
+checkpointing:
+  save_period: 5
+  keep_top_k: 1
+  checkpoint_must_save_by: 00:00:45:00
