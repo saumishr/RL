@@ -15,6 +15,7 @@
 import asyncio
 import gc
 import importlib
+import inspect
 import os
 import threading
 import time
@@ -1481,10 +1482,14 @@ class MegatronGenerationRefitMixin:
 
         # Build and cache the reshard plan (and any MXFP8 transforms) collectively.
         # All participating ranks (training + generation) call this simultaneously.
-        # execution_batch_bytes is newer than some pinned Megatron-core branches,
-        # so only pass it when it was actually configured.
+        # execution_batch_bytes is newer than some pinned Megatron-core branches.
+        # The call is collective, so probe the signature rather than retrying a
+        # failed call, which would leave the process group inconsistent.
         extra_kwargs = {}
-        if self.refit_execution_batch_bytes is not None:
+        if (
+            "execution_batch_bytes"
+            in inspect.signature(prepare_swap_model_weights).parameters
+        ):
             extra_kwargs["execution_batch_bytes"] = self.refit_execution_batch_bytes
         prepare_swap_model_weights(
             src_model=self.model if is_source else None,
