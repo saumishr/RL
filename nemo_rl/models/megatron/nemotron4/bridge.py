@@ -46,6 +46,8 @@ from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRe
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
+    FusedExpertMapping,
+    LocalHFParamSpec,
     MegatronParamMapping,
     QKVMapping,
     ReplicatedMapping,
@@ -105,101 +107,21 @@ class WideResidualLogitMapping(ReplicatedMapping):
         return super().hf_to_megatron(padded, megatron_module)
 
 
-class GroupedExpertStackMapping(MegatronParamMapping[torch.Tensor]):
-    """Stack per-expert Megatron weights into one HF 3D expert tensor.
+class Nemotron4ExpertMapping(FusedExpertMapping):
+    """Per-expert Megatron weights <-> one stacked HF expert tensor.
 
-    Transformer Engine's ``GroupedLinear`` exposes one parameter per local
-    expert (``linear_fc1.weight0``, ``weight1``, ...), while the NM4 vLLM fork
-    wants a single ``experts.up_proj``/``experts.down_proj`` of shape
-    ``(num_experts, out, in)`` which it then enumerates by ``expert_id``.
-
-    Each local expert parameter matches this mapping, but only the first one
-    does the work: it stacks every local expert off the shared module and
-    gathers the other expert-parallel ranks. The rest export nothing, since
-    emitting the same HF tensor repeatedly would be wasted bandwidth.
+    NM4's MoE is ungated -- squared ReLU, so ``linear_fc1`` is a bare
+    up-projection -- which makes both halves of the expert plain fused
+    mappings. The base class assumes the gated layout and synthesizes
+    canonical per-expert view names by stripping a ``.down_proj`` suffix,
+    which silently produces nonsense for ``up_proj``. Declining to offer
+    local views sends both halves down the normal conversion path.
     """
 
-    def _local_hf_sharding(
-        self, weight: torch.Tensor, megatron_module: nn.Module
-    ) -> tuple[str, int | None, int]:
-        return "replicated", None, 1
-
-    @staticmethod
-    def _local_expert_weights(megatron_module: nn.Module) -> list[torch.Tensor]:
-        """Return this rank's expert weights in local expert order."""
-        weights, index = [], 0
-        while (weight := getattr(megatron_module, f"weight{index}", None)) is not None:
-            weights.append(weight)
-            index += 1
-        if not weights:
-            raise AttributeError(
-                "Expected a GroupedLinear exposing 'weight0', 'weight1', ... on "
-                f"{type(megatron_module).__name__}."
-            )
-        return weights
-
-    def _is_first_local_expert(self) -> bool:
-        return self.megatron_param.endswith("weight0")
-
-    def megatron_to_hf(
-        self,
-        megatron_weights: Optional[torch.Tensor],
-        megatron_module: Optional[nn.Module],
-    ) -> Dict[str, torch.Tensor]:
-        # One export per group, driven by the first local expert.
-        if not self._is_first_local_expert():
-            return {}
-
-        megatron_weights = self.broadcast_from_pp_rank(
-            megatron_weights, cache_key=str(self.hf_param)
-        )
-        if megatron_weights is None or megatron_module is None:
-            return {}
-
-        local = torch.stack(
-            [
-                self.maybe_dequantize(weight)
-                for weight in self._local_expert_weights(megatron_module)
-            ]
-        )
-
-        from megatron.core import parallel_state
-
-        ep_group = parallel_state.get_expert_model_parallel_group()
-        ep_size = torch.distributed.get_world_size(group=ep_group)
-        if ep_size == 1:
-            return {str(self.hf_param): local}
-
-        # Megatron hands each expert-parallel rank a contiguous block of
-        # experts, so concatenating in rank order restores global expert ids.
-        shards = [torch.empty_like(local) for _ in range(ep_size)]
-        torch.distributed.all_gather(shards, local.contiguous(), group=ep_group)
-        return {str(self.hf_param): torch.cat(shards, dim=0)}
-
-    def hf_to_megatron(
-        self,
-        hf_weights: torch.Tensor,
-        megatron_module: nn.Module,
-    ) -> torch.Tensor:
-        """Return this rank's slice of the stacked HF expert tensor."""
-        from megatron.core import parallel_state
-
-        ep_group = parallel_state.get_expert_model_parallel_group()
-        ep_size = torch.distributed.get_world_size(group=ep_group)
-        ep_rank = torch.distributed.get_rank(group=ep_group)
-
-        num_experts = hf_weights.shape[0]
-        if num_experts % ep_size:
-            raise ValueError(
-                f"{num_experts} experts do not divide across {ep_size} "
-                "expert-parallel ranks."
-            )
-        per_rank = num_experts // ep_size
-
-        local_index = int(self.megatron_param.rsplit("weight", 1)[1])
-        return hf_weights[ep_rank * per_rank + local_index].to(
-            device=megatron_module.weight0.device
-        )
+    def local_hf_param_specs(
+        self, global_param_name: Optional[str] = None
+    ) -> tuple[LocalHFParamSpec, ...]:
+        return ()
 
 
 def _gdp_mixer_mappings(megatron_mixer: str, hf_layer: str) -> list[MegatronParamMapping]:
@@ -401,11 +323,14 @@ class Nemotron4Bridge(MegatronModelBridge):
                 megatron_param=f"{layer}.moe_layer.mlp.shared_experts.linear_fc2.weight",
                 hf_param=f"{hf_layer}.moe.shared_experts.down_proj.weight",
             ),
-            GroupedExpertStackMapping(
+            # Megatron per-expert shapes already match the HF stacked tensor
+            # slice for slice -- fc1.weightN is (4096, 768) against up_proj's
+            # (512, 4096, 768) -- so no transpose is needed on export.
+            Nemotron4ExpertMapping(
                 megatron_param=f"{layer}.moe_layer.mlp.experts.linear_fc1.weight*",
                 hf_param=f"{hf_layer}.moe.experts.up_proj",
             ),
-            GroupedExpertStackMapping(
+            Nemotron4ExpertMapping(
                 megatron_param=f"{layer}.moe_layer.mlp.experts.linear_fc2.weight*",
                 hf_param=f"{hf_layer}.moe.experts.down_proj",
             ),
