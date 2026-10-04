@@ -1,0 +1,95 @@
+# NT4 (Nemotron-4) Nano text-only GRPO on the single-controller path, with vLLM
+# generation.
+#
+# Why text-only for a multimodal checkpoint: the NM4 vLLM fork registers
+#   "Nemotron4ForConditionalGeneration": ("nemotron4", "Nemotron4ForCausalLM")
+# and that class is `(nn.Module, SupportsPP, IsHybrid)` -- not SupportsMultiModal.
+# Its weight mapper sends "model.vision_tower." and "model.multi_modal_projector."
+# to None, i.e. it loads the multimodal checkpoint and discards the Pixtral tower
+# and the projector. So vLLM can serve NM4's language model but has no image path
+# at all; this matches the fork's own README, which does not certify vision. Image
+# GRPO therefore has to wait for vision support upstream -- see the CLEVR sibling
+# recipe for that path, which is blocked on a separate Megatron-core protocol gap.
+#
+# This recipe exists to pipeclean everything that is not vision: NM4 model build,
+# megatron_bridge checkpoint load, Megatron -> vLLM refit across a mismatched
+# expert layout, rollout, advantage and the optimizer step.
+#
+# The parent lives under recipes/vlm/ because it carries the only NM4 training
+# block known to work (ported from Rohit's nm4_clevr_4n SFT recipe); everything
+# this file overrides is downstream of that. The parent's own `data` block is a
+# CLEVR overlay on grpo_math_1B.yaml, which is also the root of the text recipes,
+# so restoring text training is a matter of putting `data` and `env` back.
+#
+# Launch with:
+#   bash pipeclean-v2/launch_nt4nano_math_vllm_5n.sh
+# ---------------------------------------------------------------------------------
+defaults: ../vlm/vlm_grpo-nt4nano-clevr-8n4g-megatron-single-controller-async.v1.yaml
+
+policy:
+  generation:
+    backend: "vllm"
+    # Generation loads a different export of the same model than training does.
+    # Training reads the megatron_bridge checkpoint, whose provider comes from its
+    # own run_config.yaml, and `policy.model_name` stays pointed at a stand-in
+    # purely so AutoConfig succeeds in the Megatron venv -- NM4's real HF config
+    # declares model_type "nemotron4", which transformers does not know. vLLM can
+    # read it because the fork registers Nemotron4Config and vLLM calls
+    # AutoConfig.register() at import, but that registration only exists in venvs
+    # where vLLM is installed, so the two paths cannot share one directory.
+    #
+    # The two tokenizers are token-for-token identical across all 262144 vocab
+    # entries and 1000 added tokens except id 18, which this checkpoint names
+    # "<img>" and the training-side tokenizer names "<image>". Token streams match,
+    # so logprobs stay comparable between training and rollout.
+    model_name: ${oc.env:NT4_NANO_HF_CKPT,/lustre/fsw/portfolios/nemotron/users/tbarnatan/models/nm4/nemotron4-nano-wsm-vlm}
+    vllm_cfg:
+      async_engine: true
+      # The parallelism the NM4 team validated (`vllm serve --tensor-parallel-size 2`).
+      # Experts shard across the TP ranks; EP stays 1, matching their serving config.
+      tensor_parallel_size: 2
+      expert_parallel_size: 1
+      # ~194 GB of bf16 weights over TP2 is ~97 GB per GPU. The 0.6 default leaves
+      # too little of a 189 GB GB200 for KV cache once weights land.
+      gpu_memory_utilization: 0.85
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 4
+
+# Back to text: the parent's CLEVR overlay is replaced by the math task from
+# grpo_math_1B.yaml at the root of both chains. The parent's `env.clevr-cogent`
+# block is left declared but unused, since `env_name` selects math.
+data:
+  train:
+    dataset_name: OpenMathInstruct-2
+    split_validation_size: 0.05
+    seed: ${grpo.seed}
+  validation: null
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
+
+env:
+  math:
+    num_workers: 8
+    math_verify_impl: "hf_math_verify"
+
+grpo:
+  max_num_steps: 5
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+
+cluster:
+  gpus_per_node: 4
+  # 4 training nodes (TP1 x CP16 x EP16 = 16 GPUs) plus 1 generation node
+  # (4 GPUs = two TP2 vLLM replicas).
+  num_nodes: 5
+
+logger:
+  log_dir: logs/grpo-nt4nano-math-5n4g-vllm-single-controller-async
+  wandb:
+    name: grpo-nt4nano-math-5n4g-vllm-single-controller-async
