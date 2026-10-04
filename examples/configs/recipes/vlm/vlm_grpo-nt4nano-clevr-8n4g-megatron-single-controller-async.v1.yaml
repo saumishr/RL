@@ -117,6 +117,13 @@ policy:
       # inference_optimized rejects a padded routing map, and this run is bf16
       # throughout, so no quantization alignment is needed on either side.
       moe_router_padding_for_quantization: false
+      # fp8_cfg.enabled: false only declines to *enable* fp8; it leaves the
+      # provider's own fp8 fields untouched, so this checkpoint's fp8=e4m3 and
+      # fp8_recipe=mxfp8 would survive. The mxfp8 recipe plus
+      # transformer_impl=inference_optimized also makes refit try to quantize
+      # weights during the reshard. Clear both so the run is bf16 end to end.
+      fp8: null
+      fp8_recipe: blockwise
       saved_args:
         attention_backend: flash
         flash_attention_version: 4
