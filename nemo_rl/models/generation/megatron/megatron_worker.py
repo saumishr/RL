@@ -21,7 +21,7 @@ import threading
 import time
 import warnings
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import requests
@@ -259,6 +259,21 @@ def _apply_optional_inference_config_kwargs(
         inference_config_kwargs["prefix_caching_mamba_gb"] = mcore_generation_config[
             "prefix_caching_mamba_gb"
         ]
+
+    # Several of these settings are newer than some pinned Megatron-core
+    # branches. Drop the ones the installed InferenceConfig cannot accept so a
+    # recipe written against a newer pin still runs, and say which were dropped
+    # rather than letting them look applied.
+    supported = {field.name for field in dataclass_fields(InferenceConfig)}
+    unsupported = sorted(set(inference_config_kwargs) - supported)
+    for key in unsupported:
+        del inference_config_kwargs[key]
+    if unsupported:
+        warnings.warn(
+            "Ignoring Megatron inference settings this Megatron-core build does "
+            f"not support: {', '.join(unsupported)}.",
+            stacklevel=2,
+        )
 
 
 def _apply_inference_cuda_graph_scope(
