@@ -11,29 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Nemotron4 (NM4) HuggingFace interop for the Megatron backend.
+"""Nemotron4 (NM4) support for the Megatron backend.
 
 Importing this package registers both halves of what an NM4 refit needs: the
 HF config class, so ``AutoConfig`` can read an NM4 export, and the weight
 bridge, so ``AutoBridge.export_hf_weights`` can name NM4 tensors.
 """
 
-from nemo_rl.models.megatron.nemotron4.configuration_nemotron4 import (
-    Nemotron4Config,
-    Nemotron4TextConfig,
-    register_nemotron4_config,
-)
+from nemo_rl.models.huggingface.nemotron4 import register_nemotron4_config
+from nemo_rl.models.megatron.nemotron4.bridge import Nemotron4Bridge
 
 register_nemotron4_config()
 
-# Imported for the registration side effect of its @register_bridge decorator.
-from nemo_rl.models.megatron.nemotron4 import bridge as _bridge  # noqa: E402
-
-Nemotron4Bridge = _bridge.Nemotron4Bridge
-
-__all__ = [
-    "Nemotron4Bridge",
-    "Nemotron4Config",
-    "Nemotron4TextConfig",
-    "register_nemotron4_config",
-]
+__all__ = ["Nemotron4Bridge", "register_nemotron4_config"]

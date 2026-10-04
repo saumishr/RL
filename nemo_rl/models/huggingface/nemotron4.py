@@ -15,9 +15,12 @@
 
 The NM4 HF exports carry ``model_type: nemotron4`` but ship no modeling code
 and no ``auto_map``, so ``AutoConfig.from_pretrained`` cannot read them on its
-own. vLLM solves this inside its own process with an equivalent class; the
-Megatron side needs the same thing to build an ``AutoBridge`` against an NM4
-export, hence this copy.
+own. The NM4 vLLM fork registers an equivalent class, but only once vLLM is
+imported and only in venvs that have it, which is too late and too narrow:
+the Megatron workers need it to build an ``AutoBridge`` against an NM4 export,
+and the vLLM workers need it before vLLM loads, because
+``ModelFlag.VLLM_LOAD_FORMAT_AUTO`` reads the config first. Hence this copy,
+which lives beside the other backend-agnostic HF helpers.
 
 Kept deliberately field-for-field compatible with the vLLM fork's
 ``vllm/transformers_utils/configs/nemotron4.py`` so the two agree on what a
