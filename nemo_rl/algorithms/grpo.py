@@ -1257,7 +1257,13 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
-    generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    # Needed for vLLM. Generation may have to load a different export of the same
+    # model than training does: NM4 trains from a megatron_bridge checkpoint whose
+    # provider comes from its own run_config, while vLLM needs the HF directory,
+    # and the two cannot be the same path. Only fall back to the policy's path
+    # when the recipe has not named one.
+    if not generation_config.get("model_name"):
+        generation_config["model_name"] = policy_config["model_name"]
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
     remote_synchronizer_cls = None
