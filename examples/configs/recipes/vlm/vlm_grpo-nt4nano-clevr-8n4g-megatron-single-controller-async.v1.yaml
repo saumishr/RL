@@ -85,10 +85,9 @@ policy:
     mtp_num_layers: 2
     mtp_loss_scaling_factor: 0.3
     mtp_use_repeated_layer: true
-    recompute_vision: false
-    vision_recompute_granularity: full
-    vision_recompute_method: block
-    vision_recompute_num_layers: 30
+    # No vision recompute keys: those are RADIO tower controls on the Nemotron
+    # Omni provider. ExperimentalNM4LlavaProvider drives a Pixtral tower and has
+    # no such fields, and setting one is a hard error in setup_model_config.
     env_vars:
       FLA_TILELANG: '0'
       NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
