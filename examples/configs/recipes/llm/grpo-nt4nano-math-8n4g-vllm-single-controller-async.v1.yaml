@@ -22,7 +22,7 @@
 # so restoring text training is a matter of putting `data` and `env` back.
 #
 # Launch with:
-#   bash pipeclean-v2/launch_nt4nano_math_vllm_5n.sh
+#   bash pipeclean-v2/launch_nt4nano_math_vllm_8n.sh
 # ---------------------------------------------------------------------------------
 defaults: ../vlm/vlm_grpo-nt4nano-clevr-8n4g-megatron-single-controller-async.v1.yaml
 
@@ -55,7 +55,7 @@ policy:
     colocated:
       enabled: false
       resources:
-        num_nodes: 1
+        num_nodes: 4
         gpus_per_node: 4
 
 # Back to text: the parent's CLEVR overlay is replaced by the math task from
@@ -85,11 +85,13 @@ grpo:
 
 cluster:
   gpus_per_node: 4
-  # 4 training nodes (TP1 x CP16 x EP16 = 16 GPUs) plus 1 generation node
-  # (4 GPUs = two TP2 vLLM replicas).
-  num_nodes: 5
+  # 4 training nodes (TP1 x CP16 x EP16 = 16 GPUs) plus 4 generation nodes
+  # (16 GPUs = eight TP2 vLLM replicas). Generation needs only one node for
+  # capacity, but ray.sub declares `#SBATCH --segment=8`, so Slurm requires the
+  # node count to be a multiple of 8.
+  num_nodes: 8
 
 logger:
-  log_dir: logs/grpo-nt4nano-math-5n4g-vllm-single-controller-async
+  log_dir: logs/grpo-nt4nano-math-8n4g-vllm-single-controller-async
   wandb:
-    name: grpo-nt4nano-math-5n4g-vllm-single-controller-async
+    name: grpo-nt4nano-math-8n4g-vllm-single-controller-async
