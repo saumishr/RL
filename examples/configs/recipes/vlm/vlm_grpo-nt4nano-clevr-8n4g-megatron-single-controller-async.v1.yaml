@@ -167,6 +167,11 @@ policy:
       expert_tensor_parallel_size: 1
       context_parallel_size: 1
       max_tokens: ${policy.max_total_sequence_length}
+      # The training config recomputes 'residual_stream', whose checkpoint
+      # manager runs outside graph capture, so Megatron requires graphs off.
+      # The inference cfg inherits recompute_modules from training, so the
+      # parent's 'local' is not usable here.
+      cuda_graph_impl: none
     colocated:
       enabled: false
       resources:
