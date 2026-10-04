@@ -605,8 +605,14 @@ class MegatronGenerationMixin:
             "logprobs_mode": mcore_generation_config["logprobs_mode"],
             "max_requests": max_requests,
             "image_preprocessing_config": image_preprocessing_config,
-            "video_preprocessing_config": video_preprocessing_config,
         }
+        # Video preprocessing is opt-in and InferenceConfig only grew the field
+        # after some pinned Megatron-core branches were cut, so forward it only
+        # when a video config was actually built.
+        if video_preprocessing_config is not None:
+            inference_config_kwargs["video_preprocessing_config"] = (
+                video_preprocessing_config
+            )
         _apply_optional_inference_config_kwargs(
             inference_config_kwargs, mcore_generation_config
         )
