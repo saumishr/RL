@@ -1,0 +1,187 @@
+# NT4 (Nemotron-4) Nano CLEVR GRPO on the single-controller path.
+#
+# The model is a ~93B hybrid Mamba/MoE multimodal checkpoint: 72 layers, hidden
+# 3072, 512 experts at top-k 10, MTP depth 2, squared-ReLU, RMSNorm, no position
+# embedding (the hybrid layers carry position), and a Pixtral vision tower. None
+# of that is read from `policy.model_name` -- for `megatron_bridge` format the
+# provider comes from the checkpoint's own run_config.yaml, which names
+# `megatron.bridge.models.experimental_nm4_llava_provider.ExperimentalNM4LlavaProvider`.
+#
+# The training block below is ported from Rohit's nm4_clevr_4n.yaml on
+# rohitrango/NeMo-RL @ rohit/sft_v2_up_n4, which is the only configuration known
+# to have trained this checkpoint (Slurm jobs 4079404/4083225). That recipe is
+# SFT; everything under `policy.generation` here is new, because no one has run
+# NT4 generation in NeMo-RL yet. Treat the generation block as unvalidated.
+#
+# Requires Megatron-Bridge at e5629351 (liding/Megatron-Bridge, branch
+# rohit/nm4-mlm-to-bridge) for the provider, and a venv built with
+# FlashAttention 4. The bridge commit pinned on this branch does not contain it.
+# ---------------------------------------------------------------------------------
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml
+
+checkpointing:
+  pretrained_checkpoint:
+    path: ${oc.env:NT4_NANO_CKPT_PATH,/lustre/fs1/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nm4_nano_bridge}
+    format: megatron_bridge
+  enabled: false
+
+policy:
+  # NM4 Nano ships no HF config of its own. Rohit's recipe points model_name at an
+  # unrelated model purely to satisfy AutoConfig/AutoBridge in
+  # finalize_megatron_setup(); the resulting bridge object is only consumed on the
+  # HF-export refit path, which refit_transport=mcore bypasses. Mirrored here.
+  model_name: ${oc.env:NT4_NANO_HF_CONFIG,/lustre/fs1/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/Mistral-Medium-3.5-128B}
+  tokenizer:
+    # Verified against the checkpoint: eos/pad ids 2/3 match its
+    # null_tokenizer_eod_id/null_tokenizer_pad_id, and the highest token id 262143
+    # falls inside padded_vocab_size 262272.
+    name: ${oc.env:NT4_NANO_PROCESSOR,/lustre/fs1/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nt4-nano-processor}
+    chat_template: default
+  is_vlm: true
+  precision: bfloat16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # 8192 is the checkpoint's seq_length and max_position_embeddings, so this is the
+  # ceiling without extending RoPE. Rohit trains at 65536, which CLEVR does not need
+  # and which would make rollouts needlessly expensive. Divisible by 2*CP as required.
+  max_total_sequence_length: 8192
+  sequence_packing:
+    enabled: true
+    # Quantile balancing and chunkwise CP cannot consume a packed MoE mask yet.
+    mask_padding_from_moe: false
+
+  megatron_cfg:
+    # TP is pinned to 1 by the architecture, not by preference: num_query_groups is 1
+    # and Megatron requires it to be divisible by the tensor parallel size.
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    context_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules:
+      - residual_stream
+      - moe_act
+      - gdp_in_proj
+      - gdp_qkv
+    freeze_vision_encoder: true
+    freeze_vision_projector: false
+    attention_backend: flash
+    moe_router_dtype: fp32
+    moe_router_fusion: true
+    moe_router_load_balancing_type: quantile_balancing
+    moe_router_bias_update_rate: 0.001
+    moe_permute_fusion: true
+    moe_grouped_gemm: true
+    moe_token_dispatcher_type: alltoall
+    moe_aux_loss_coeff: 0.0
+    apply_rope_fusion: false
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    use_gloo_process_groups: false
+    use_fused_weighted_squared_relu: true
+    mtp_num_layers: 2
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    recompute_vision: false
+    vision_recompute_granularity: full
+    vision_recompute_method: block
+    vision_recompute_num_layers: 30
+    env_vars:
+      FLA_TILELANG: '0'
+      NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
+      NVTE_USE_CUTLASS_GROUPED_GEMM: '0'
+      NVTE_FWD_LAYERNORM_SM_MARGIN: '40'
+      NVTE_BWD_LAYERNORM_SM_MARGIN: '40'
+      NVTE_INF_LAYERNORM_SM_MARGIN: '40'
+      OMP_NUM_THREADS: '16'
+      UB_TIMEOUT: '720'
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: '128'
+    # Passed through to the provider. These are properties of the checkpoint, not
+    # tuning knobs -- changing them changes the model.
+    model_overrides:
+      moe_router_score_function: sigmoid
+      moe_router_topk: 10
+      num_moe_experts: 512
+      moe_router_topk_scaling_factor: 3.16
+      moe_router_quantile_balancing_estimation_scope: global_batch
+      moe_router_qb_num_bins: 1000
+      moe_router_quantile_balancing_ema: 0.0
+      moe_router_pre_softmax: false
+      moe_router_enable_expert_bias: false
+      moe_router_skip_muon: true
+      linear_cp_mode: chunkwise
+      linear_cp_layout: contiguous
+      saved_args:
+        attention_backend: flash
+        flash_attention_version: 4
+        mimo_vision_encoder_attention_backend: flash
+        mimo_vision_encoder_flash_attention_version: 4
+    optimizer:
+      # Muon is what Rohit's runs used for this checkpoint; moe_router_skip_muon
+      # above keeps the router on Adam.
+      optimizer: muon
+      lr: 1.5e-05
+      min_lr: 2.0e-06
+      weight_decay: 0.1
+      muon_momentum: 0.9
+      muon_split_qkv: true
+      muon_extra_scale_factor: 0.2
+      muon_scale_mode: spectral
+      muon_coefficient_type: polar_express
+      muon_scalar_optimizer: adam
+      muon_expert_tp_mode: layer_sharded
+      use_distributed_optimizer: true
+      use_layer_wise_distributed_optimizer: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      data_parallel_sharding_strategy: no_shard
+
+  generation:
+    max_new_tokens: 1024
+    mcore_generation_config:
+      # The generic VLM wrapper rather than the omni one: NM4's vision tower is
+      # Pixtral (processor_config.json declares PixtralProcessor with patch_size 14,
+      # spatial_merge_size 2), so the omni wrapper's RADIO assumptions do not hold.
+      # VLMInferenceWrapper handles imgs_sizes dynamic resolution and exposes
+      # get_preexpanded_media_token_id, which matches NM4LlavaModel's contract that
+      # the prompt already carries one placeholder per projected patch.
+      # UNVALIDATED -- no NT4 generation has been run in NeMo-RL.
+      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper.VLMInferenceWrapper
+      image_dynamic_resolution: true
+      # Mirror the training expert layout so refit needs no expert resharding.
+      tensor_model_parallel_size: 1
+      expert_model_parallel_size: 16
+      expert_tensor_parallel_size: 1
+      context_parallel_size: 1
+      max_tokens: ${policy.max_total_sequence_length}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+
+grpo:
+  max_num_steps: 5
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+
+data:
+  default:
+    # TODO the checkpoint records sft_tokenizer_prompt_format "nemotron-h-aligned";
+    # this prompt is written for the omni chat format and likely needs rewriting.
+    prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
+
+cluster:
+  gpus_per_node: 4
+  # 4 training nodes (TP1 x CP16 x EP16 = 16 GPUs, matching Rohit's nm4_clevr_4n)
+  # plus 4 generation nodes.
+  num_nodes: 8
+  segment_size: null
+
+logger:
+  wandb:
+    project: nemo-rl-nt4nano
+    name: nt4nano-clevr-grpo-pipeclean
