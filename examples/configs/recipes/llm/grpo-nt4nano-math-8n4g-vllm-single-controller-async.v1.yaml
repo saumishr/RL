@@ -50,6 +50,16 @@ policy:
     # now makes possible.
     refit_transport: null
     model_name: ${policy.model_name}
+    # The image ships nvidia-cutlass-dsl 4.6.2 against quack-kernels 0.6.5, and
+    # quack still imports `cutlass.base_dsl.enums.Arch`, which 4.6.2 moved to
+    # `cutlass.base_dsl.arch`. Every warmup path that reaches quack therefore
+    # dies with ModuleNotFoundError before the engine finishes starting. Both
+    # paths are pure ahead-of-time compilation of MoE router GEMMs, so turning
+    # them off costs first-token latency and nothing else.
+    vllm_kwargs:
+      kernel_config:
+        enable_jit_warmup: false
+        enable_cutedsl_warmup: false
     vllm_cfg:
       async_engine: true
       # The parallelism the NM4 team validated (`vllm serve --tensor-parallel-size 2`).
