@@ -185,6 +185,9 @@ policy:
       cuda_graph_impl: none
       # Megatron only allows the 'none' scope once graphs are off.
       inference_cuda_graph_scope: none
+      # This Megatron-core pin predates the 'hybrid' spacing the parent uses.
+      # Inert with graphs off, but the value is still parsed into the enum.
+      cuda_graph_sizing_distribution: exponential
     colocated:
       enabled: false
       resources:
