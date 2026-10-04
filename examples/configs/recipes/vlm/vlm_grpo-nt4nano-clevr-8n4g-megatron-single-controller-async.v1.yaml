@@ -165,11 +165,12 @@ policy:
       # The generic VLM wrapper rather than the omni one: NM4's vision tower is
       # Pixtral (processor_config.json declares PixtralProcessor with patch_size 14,
       # spatial_merge_size 2), so the omni wrapper's RADIO assumptions do not hold.
-      # VLMInferenceWrapper handles imgs_sizes dynamic resolution and exposes
-      # get_preexpanded_media_token_id, which matches NM4LlavaModel's contract that
-      # the prompt already carries one placeholder per projected patch.
+      # VLMInferenceWrapper handles imgs_sizes dynamic resolution. The subclass
+      # restores the supports_* flags this Megatron-core pin predates; without
+      # them the worker treats generation as text-only and passes the whole
+      # NM4LlavaModel to code that expects a bare language model.
       # UNVALIDATED -- no NT4 generation has been run in NeMo-RL.
-      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper.VLMInferenceWrapper
+      megatron_inference_wrapper: nemo_rl.models.generation.megatron.inference_wrappers.VLMInferenceWrapperWithModalities
       image_dynamic_resolution: true
       # Mirror the training expert layout so refit needs no expert resharding.
       tensor_model_parallel_size: 1
