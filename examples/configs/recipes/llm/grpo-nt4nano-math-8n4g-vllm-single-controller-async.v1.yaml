@@ -35,22 +35,21 @@ policy:
   # directory, which carries tokenizer.json and tokenizer_config.json, so
   # AutoTokenizer loads it fine without the image side.
   is_vlm: false
+  # Both training and generation now name the real NM4 HF export. The parent
+  # points this at an unrelated stand-in because AutoConfig cannot read
+  # model_type "nemotron4" and AutoBridge has no NM4 mapping; both gaps are
+  # closed by nemo_rl/models/megatron/nemotron4, which the Megatron setup
+  # imports. The export is only ever read for its config and parameter names --
+  # weights still come from the megatron_bridge checkpoint.
+  model_name: ${oc.env:NT4_NANO_HF_CKPT,/lustre/fsw/portfolios/nemotron/users/tbarnatan/models/nm4/nemotron4-nano-wsm-vlm}
   generation:
     backend: "vllm"
-    # Generation loads a different export of the same model than training does.
-    # Training reads the megatron_bridge checkpoint, whose provider comes from its
-    # own run_config.yaml, and `policy.model_name` stays pointed at a stand-in
-    # purely so AutoConfig succeeds in the Megatron venv -- NM4's real HF config
-    # declares model_type "nemotron4", which transformers does not know. vLLM can
-    # read it because the fork registers Nemotron4Config and vLLM calls
-    # AutoConfig.register() at import, but that registration only exists in venvs
-    # where vLLM is installed, so the two paths cannot share one directory.
-    #
-    # The two tokenizers are token-for-token identical across all 262144 vocab
-    # entries and 1000 added tokens except id 18, which this checkpoint names
-    # "<img>" and the training-side tokenizer names "<image>". Token streams match,
-    # so logprobs stay comparable between training and rollout.
-    model_name: ${oc.env:NT4_NANO_HF_CKPT,/lustre/fsw/portfolios/nemotron/users/tbarnatan/models/nm4/nemotron4-nano-wsm-vlm}
+    # The parent pins refit_transport=mcore, which moves weights Megatron to
+    # Megatron and never needs HF names. No vLLM transport can do that: they all
+    # export through AutoBridge.export_hf_weights, which is what the NM4 bridge
+    # now makes possible.
+    refit_transport: null
+    model_name: ${policy.model_name}
     vllm_cfg:
       async_engine: true
       # The parallelism the NM4 team validated (`vllm serve --tensor-parallel-size 2`).
