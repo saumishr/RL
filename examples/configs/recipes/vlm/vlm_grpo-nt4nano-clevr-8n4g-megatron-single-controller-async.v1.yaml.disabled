@@ -21,7 +21,7 @@ defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-
 
 checkpointing:
   pretrained_checkpoint:
-    path: ${oc.env:NT4_NANO_CKPT_PATH,/lustre/fs1/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nm4_nano_bridge}
+    path: ${oc.env:NT4_NANO_CKPT_PATH,/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nm4_nano_bridge}
     format: megatron_bridge
   enabled: false
 
@@ -30,12 +30,12 @@ policy:
   # unrelated model purely to satisfy AutoConfig/AutoBridge in
   # finalize_megatron_setup(); the resulting bridge object is only consumed on the
   # HF-export refit path, which refit_transport=mcore bypasses. Mirrored here.
-  model_name: ${oc.env:NT4_NANO_HF_CONFIG,/lustre/fs1/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/Mistral-Medium-3.5-128B}
+  model_name: ${oc.env:NT4_NANO_HF_CONFIG,/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/Mistral-Medium-3.5-128B}
   tokenizer:
     # Verified against the checkpoint: eos/pad ids 2/3 match its
     # null_tokenizer_eod_id/null_tokenizer_pad_id, and the highest token id 262143
     # falls inside padded_vocab_size 262272.
-    name: ${oc.env:NT4_NANO_PROCESSOR,/lustre/fs1/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nt4-nano-processor}
+    name: ${oc.env:NT4_NANO_PROCESSOR,/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nt4-nano-processor}
     chat_template: default
   is_vlm: true
   precision: bfloat16
