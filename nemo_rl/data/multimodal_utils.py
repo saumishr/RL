@@ -71,6 +71,9 @@ _PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
         "NemotronH_Omni_Reasoning_V3Processor",
+        # Expands <image> into per-patch tokens with break/end markers through
+        # __call__, and reports native per-image sizes for dynamic resolution.
+        "PixtralProcessor",
     }
 )
 
