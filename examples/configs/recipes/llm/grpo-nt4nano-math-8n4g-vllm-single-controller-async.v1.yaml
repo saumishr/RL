@@ -27,6 +27,14 @@
 defaults: ../vlm/vlm_grpo-nt4nano-clevr-8n4g-megatron-single-controller-async.v1.yaml
 
 policy:
+  # The parent sets this true, which builds an AutoProcessor instead of a plain
+  # tokenizer -- and `nemo_rl/data/utils.py` then forces *every* declared
+  # environment to VLMEnvironment ("vlm" if is_vlm else env_name), so the math
+  # env was constructed as a VLM env and died on the reward_functions key it
+  # does not have. The tokenizer path still points at the NT4 processor
+  # directory, which carries tokenizer.json and tokenizer_config.json, so
+  # AutoTokenizer loads it fine without the image side.
+  is_vlm: false
   generation:
     backend: "vllm"
     # Generation loads a different export of the same model than training does.
