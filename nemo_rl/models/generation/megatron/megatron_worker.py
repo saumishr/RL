@@ -2181,7 +2181,9 @@ class MegatronGenerationRefitMixin:
                 group=None,
                 src_rank_offset=0,
                 dst_rank_offset=0,
-                execution_batch_bytes=execution_batch_bytes,
+                **_execution_batch_bytes_kwarg(
+                    prepare_swap_model_weights, execution_batch_bytes
+                ),
             )
             self._swap_weights_plan_prepared = True
 
@@ -2194,7 +2196,7 @@ class MegatronGenerationRefitMixin:
             group=None,
             src_rank_offset=0,
             dst_rank_offset=0,
-            execution_batch_bytes=execution_batch_bytes,
+            **_execution_batch_bytes_kwarg(swap_model_weights, execution_batch_bytes),
         )
         # Offload training model.
         self.model = self.move_model(
