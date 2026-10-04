@@ -156,6 +156,18 @@ def _resolve_mxfp8_refit_backend(model_config: Any) -> str:
     return resolve_mxfp8_backend(model_config.inference_grouped_gemm_backend)
 
 
+def _execution_batch_bytes_kwarg(fn: Any, value: int | None) -> dict[str, int]:
+    """Pass `execution_batch_bytes` only to Megatron refit entrypoints that take it.
+
+    The parameter is newer than some pinned Megatron-core branches. These calls
+    are collective, so the signature is probed rather than retrying a failed
+    call, which would leave the process group desynchronized.
+    """
+    if value is None or "execution_batch_bytes" not in inspect.signature(fn).parameters:
+        return {}
+    return {"execution_batch_bytes": value}
+
+
 @dataclass
 class _MegatronRefitTask:
     """A Bridge import task and its mutable inference destination."""
@@ -1482,22 +1494,15 @@ class MegatronGenerationRefitMixin:
 
         # Build and cache the reshard plan (and any MXFP8 transforms) collectively.
         # All participating ranks (training + generation) call this simultaneously.
-        # execution_batch_bytes is newer than some pinned Megatron-core branches.
-        # The call is collective, so probe the signature rather than retrying a
-        # failed call, which would leave the process group inconsistent.
-        extra_kwargs = {}
-        if (
-            "execution_batch_bytes"
-            in inspect.signature(prepare_swap_model_weights).parameters
-        ):
-            extra_kwargs["execution_batch_bytes"] = self.refit_execution_batch_bytes
         prepare_swap_model_weights(
             src_model=self.model if is_source else None,
             target_model=None if is_source else self.model,
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
-            **extra_kwargs,
+            **_execution_batch_bytes_kwarg(
+                prepare_swap_model_weights, self.refit_execution_batch_bytes
+            ),
         )
 
     def preinit_nvshmem_collective(self) -> None:
@@ -1534,7 +1539,9 @@ class MegatronGenerationRefitMixin:
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
-            execution_batch_bytes=self.refit_execution_batch_bytes,
+            **_execution_batch_bytes_kwarg(
+                swap_model_weights, self.refit_execution_batch_bytes
+            ),
         )
 
         return True
