@@ -170,9 +170,17 @@ grpo:
 
 data:
   default:
-    # TODO the checkpoint records sft_tokenizer_prompt_format "nemotron-h-aligned";
-    # this prompt is written for the omni chat format and likely needs rewriting.
-    prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
+    # NT4's chat template emits "<|im_start|>assistant\n<think>\n" for the generation
+    # prompt when enable_thinking is on (its default), so the completion starts inside
+    # the reasoning block. The prompt therefore asks the model to close </think> rather
+    # than to open <think>, which clevr_cogent_cot.txt does and would double up.
+    #
+    # Consequence for reward: format_reward looks for <think>...</think> in the
+    # response, and the opening tag lives in the prompt, so its 0.25 component is
+    # unreachable here. That is cosmetic rather than a bug -- it is constant across
+    # every sample in a group, so it cancels in the GRPO advantage and only shifts the
+    # logged reward.
+    prompt_file: examples/prompts/clevr_cogent_cot_nt4nano.txt
 
 cluster:
   gpus_per_node: 4
