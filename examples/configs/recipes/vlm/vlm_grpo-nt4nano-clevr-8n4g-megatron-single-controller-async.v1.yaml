@@ -113,6 +113,10 @@ policy:
       moe_router_skip_muon: true
       linear_cp_mode: chunkwise
       linear_cp_layout: contiguous
+      # The checkpoint was trained with this on, but transformer_impl=
+      # inference_optimized rejects a padded routing map, and this run is bf16
+      # throughout, so no quantization alignment is needed on either side.
+      moe_router_padding_for_quantization: false
       saved_args:
         attention_backend: flash
         flash_attention_version: 4
@@ -134,6 +138,13 @@ policy:
       muon_expert_tp_mode: layer_sharded
       use_distributed_optimizer: true
       use_layer_wise_distributed_optimizer: true
+      # Megatron asserts precision-aware optimizer is adam-only, and the
+      # checkpoint's own run_config trained muon with it off and fp32 moments.
+      # store_param_remainders is a precision-aware feature, so it goes too.
+      use_precision_aware_optimizer: false
+      store_param_remainders: false
+      exp_avg_dtype: float32
+      exp_avg_sq_dtype: float32
     distributed_data_parallel_config:
       grad_reduce_in_fp32: true
       data_parallel_sharding_strategy: no_shard
