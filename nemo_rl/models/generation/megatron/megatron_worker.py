@@ -1481,13 +1481,18 @@ class MegatronGenerationRefitMixin:
 
         # Build and cache the reshard plan (and any MXFP8 transforms) collectively.
         # All participating ranks (training + generation) call this simultaneously.
+        # execution_batch_bytes is newer than some pinned Megatron-core branches,
+        # so only pass it when it was actually configured.
+        extra_kwargs = {}
+        if self.refit_execution_batch_bytes is not None:
+            extra_kwargs["execution_batch_bytes"] = self.refit_execution_batch_bytes
         prepare_swap_model_weights(
             src_model=self.model if is_source else None,
             target_model=None if is_source else self.model,
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
-            execution_batch_bytes=self.refit_execution_batch_bytes,
+            **extra_kwargs,
         )
 
     def preinit_nvshmem_collective(self) -> None:
