@@ -18,11 +18,11 @@ NM4 cannot be refit into vLLM: every vLLM refit transport exports through
 ``AutoBridge.export_hf_weights``, and only ``refit_transport=mcore`` (Megatron
 to Megatron) avoids HF naming. This supplies the missing mapping.
 
-Scope is the language model plus ``lm_head``. The vision tower and the
-multimodal projector are deliberately absent because the NM4 vLLM fork maps
-``model.vision_tower.`` and ``model.multi_modal_projector.`` to ``None`` and
-is not ``SupportsMultiModal`` -- it discards them on load. The MTP tower is
-absent for the same reason: the HF export has none.
+Scope is the language model plus ``lm_head``: 832 HF tensors. The vision
+tower, the multimodal projector and the MTP tower are claimed by
+``UnexportedMapping`` so the strict registry accepts them while refit skips
+them -- the vLLM fork discards the first two on load and never builds the
+third.
 
 Naming notes, each verified against a live 93B instantiation rather than the
 checkpoint, because ``export_hf_weights`` walks ``named_parameters()``:
@@ -105,6 +105,45 @@ class WideResidualLogitMapping(ReplicatedMapping):
         padded = hf_weights.new_zeros(max(_LOGIT_PAD_NUMEL, num_streams))
         padded[:num_streams] = hf_weights
         return super().hf_to_megatron(padded, megatron_module)
+
+
+class UnexportedMapping(MegatronParamMapping[torch.Tensor]):
+    """Claim a Megatron parameter that refit deliberately does not carry.
+
+    ``build_conversion_tasks`` is strict: a Megatron parameter with no mapping
+    aborts the whole registry, so "not exported" has to be stated rather than
+    omitted. Exporting nothing is safe because the names vLLM is told to expect
+    come from ``export_hf_weights``, which only yields what ``megatron_to_hf``
+    produces.
+
+    The HF name is a sentinel. It is never looked up: ``allow_hf_name_mismatch``
+    skips the checkpoint-key check, and nothing resolves these in the HF
+    direction.
+    """
+
+    def __init__(self, megatron_param: str):
+        super().__init__(megatron_param, f"<unexported>:{megatron_param}")
+        self.allow_hf_name_mismatch = True
+
+    def resolve(self, captures: tuple[str, ...]) -> "UnexportedMapping":
+        resolved_megatron_param, _ = self._resolve_names(captures)
+        return type(self)(resolved_megatron_param)
+
+    def megatron_to_hf(
+        self,
+        megatron_weights: Optional[torch.Tensor],
+        megatron_module: Optional[nn.Module],
+    ) -> Dict[str, torch.Tensor]:
+        return {}
+
+    def hf_to_megatron(
+        self,
+        hf_weights: torch.Tensor,
+        megatron_module: nn.Module,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{self.megatron_param} has no HF counterpart to import from."
+        )
 
 
 class Nemotron4ExpertMapping(FusedExpertMapping):
@@ -339,5 +378,24 @@ class Nemotron4Bridge(MegatronModelBridge):
             f"{layer}.moe_layer.residual_connection_mlp",
             f"{hf_layer}.moe_residual_connection",
         )
+
+        # Everything refit does not carry. Listed last: lookup takes the first
+        # matching pattern, so a catch-all must not precede a real mapping.
+        mappings += [
+            # The HF export does contain the Pixtral tower (272 tensors) and
+            # the projector (4), but the vLLM fork maps both to None on load,
+            # so shipping them every step would move ~400M parameters into a
+            # discard. Map them properly when the fork grows an image path.
+            UnexportedMapping("vision_model.**"),
+            UnexportedMapping("vision_projection.**"),
+            # The HF export has no MTP tensors at all, so vLLM never builds
+            # the tower and has nothing to refit into.
+            UnexportedMapping("language_model.mtp.**"),
+            # Router quantization-bin buffers, no HF counterpart on any layer.
+            # qb_histogram is non-persistent, so it stays out of the state dict
+            # the strict check walks, but named_buffers() still reports it.
+            UnexportedMapping(f"{layer}.moe_layer.mlp.router.qb_bin_bounds"),
+            UnexportedMapping(f"{layer}.moe_layer.mlp.router.qb_histogram"),
+        ]
 
         return MegatronMappingRegistry(*mappings)
