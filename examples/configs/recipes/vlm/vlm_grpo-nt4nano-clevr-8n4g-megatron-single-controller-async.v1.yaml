@@ -137,7 +137,10 @@ policy:
       muon_scalar_optimizer: adam
       muon_expert_tp_mode: layer_sharded
       use_distributed_optimizer: true
-      use_layer_wise_distributed_optimizer: true
+      # The layer-wise path asserts every optimizer param appears in a DDP
+      # param layout, and one GDP projection in this model does not. Muon does
+      # not require it, so use the regular distributed optimizer instead.
+      use_layer_wise_distributed_optimizer: false
       # Megatron asserts precision-aware optimizer is adam-only, and the
       # checkpoint's own run_config trained muon with it off and fp32 moments.
       # store_param_remainders is a precision-aware feature, so it goes too.
@@ -172,6 +175,8 @@ policy:
       # The inference cfg inherits recompute_modules from training, so the
       # parent's 'local' is not usable here.
       cuda_graph_impl: none
+      # Megatron only allows the 'none' scope once graphs are off.
+      inference_cuda_graph_scope: none
     colocated:
       enabled: false
       resources:
