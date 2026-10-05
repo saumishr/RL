@@ -56,6 +56,17 @@ policy:
     # the restriction, so it cannot fall back on its own. cuDNN carries no such
     # limit and supports thd with context parallelism and no_bias.
     attention_backend: fused
+    model_overrides:
+      saved_args:
+        # The provider builds three configs in one process -- language, Pixtral
+        # tower, projector -- and Megatron's set_attention_backend writes the
+        # NVTE_* variables, which are process-wide, from each in turn. It
+        # asserts rather than overwrite a conflicting value, so the vision
+        # encoder has to agree with the language model above. This run never
+        # runs the tower (text-only, and vLLM discards it), so the backend it
+        # is built with is immaterial beyond matching.
+        attention_backend: fused
+        mimo_vision_encoder_attention_backend: fused
   generation:
     backend: "vllm"
     # The parent pins refit_transport=mcore, which moves weights Megatron to
