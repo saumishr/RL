@@ -48,9 +48,10 @@ export GPUS_PER_NODE=4
 export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-32}"
 export NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
 export NUM_GYM_NODES="${NUM_GYM_NODES:-2}"
-# Lightning uses 2; ray.sub asks for contiguous NVL72 segments and every NM4
-# run so far has used 8. 64 Ray nodes divide by 8, so this costs nothing.
-export SEGMENT_SIZE="${SEGMENT_SIZE:-8}"
+# 2, not the 8 the earlier NM4 runs used. The Ray allocation is train + gen +
+# gym = 66 nodes, and the launcher requires the segment size to divide it; 8
+# does not. This is a constraint of the shape, not a preference.
+export SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
 export EXTERNAL_VLLM_SEGMENT_SIZE="${EXTERNAL_VLLM_SEGMENT_SIZE:-2}"
 
 # -----------------------------------------------------------------------------
@@ -87,6 +88,36 @@ export ENABLE_MTP_INFERENCE="${ENABLE_MTP_INFERENCE:-0}"
 #     --tokenizer <NT4 processor dir> --max-prompt-tokens 4096
 export TRAIN_PATH="${TRAIN_PATH:?TRAIN_PATH is required (filtered RLVR jsonl; see filter_rlvr_by_length.py)}"
 export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
+
+# -----------------------------------------------------------------------------
+# Mounts
+# -----------------------------------------------------------------------------
+# ray.sub mounts nothing but MOUNTS, and Lightning's launcher builds that from a
+# fixed list that includes its own recipe directory but not ours. Everything
+# this profile reaches for therefore has to be declared, including the model
+# directories -- none of /lustre is visible by default.
+#
+# Checkpoints are mounted read-only at their own paths so the config can name
+# them literally. They belong to other users and are read-only to us anyway;
+# the flag makes that explicit rather than incidental.
+_nt4_mounts=(
+  "${SCRIPT_DIR}:/opt/nemo-rl/examples/nemo_gym/nt4-nano"
+  "$(dirname "${MODEL_PATH}"):$(dirname "${MODEL_PATH}"):ro"
+  "$(dirname "${GENRM_MODEL}"):$(dirname "${GENRM_MODEL}"):ro"
+  "$(dirname "${NL2BASH_JUDGE_MODEL}"):$(dirname "${NL2BASH_JUDGE_MODEL}"):ro"
+  "$(dirname "${TRAIN_PATH}"):$(dirname "${TRAIN_PATH}")"
+)
+# The NL2Bash and safety checkpoints usually share a parent; only add it once,
+# since a duplicate container-mounts entry is an error rather than a no-op.
+if [[ "$(dirname "${SAFETY_JUDGE_MODEL}")" != "$(dirname "${NL2BASH_JUDGE_MODEL}")" ]]; then
+  _nt4_mounts+=("$(dirname "${SAFETY_JUDGE_MODEL}"):$(dirname "${SAFETY_JUDGE_MODEL}"):ro")
+fi
+
+_joined="$(
+  IFS=,
+  printf '%s' "${_nt4_mounts[*]}"
+)"
+export EXTRA_MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${_joined}"
 
 # -----------------------------------------------------------------------------
 # Hand off to Lightning's launcher, which owns the Slurm hetjob and the

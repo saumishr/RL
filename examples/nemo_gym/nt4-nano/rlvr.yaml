@@ -39,10 +39,13 @@ defaults: ../../configs/recipes/llm/grpo-nt4nano-math-32n4g-vllm-single-controll
 # =============================================================================
 cluster:
   gpus_per_node: 4
+  # Training plus generation. The launcher overrides this with the same sum and
+  # places the two gym nodes on top, for 66 Ray nodes in hetgroup 0.
   num_nodes: 64
-  # Lightning uses 2. We keep the 8 the NM4 runs have always used: ray.sub asks
-  # for contiguous NVL72 segments and 64 divides by 8, so nothing is lost.
-  segment_size: 8
+  # 2, unlike the 8 the earlier NM4 runs used. The segment size has to divide
+  # the Ray allocation, and that is 66 once the gym nodes are included, which 8
+  # does not divide. A constraint of the shape rather than a preference.
+  segment_size: 2
 
 # =============================================================================
 # GRPO
