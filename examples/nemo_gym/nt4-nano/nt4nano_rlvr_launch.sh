@@ -83,6 +83,15 @@ export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fs1/portfolios/llmservi
 
 export ENABLE_EXTERNAL_VLLM=1
 
+# The judge pools run GENRM_CONTAINER, which is a vllm-openai image, not the
+# NeMo-RL container. Lightning's default interpreter is a per-actor uv venv
+# under /opt/ray_venvs that exists only in the NeMo-RL image, so every replica
+# died with "No such file or directory" before vLLM ever started. In the judge
+# image vLLM is the system interpreter's own package -- probed on this cluster
+# as vLLM 0.27.1 on Python 3.12.13 at this path, with no /opt/ray_venvs at all.
+# NL2BASH_VLLM_PYTHON defaults to this, so one setting covers both pools.
+export GENRM_VLLM_PYTHON="${GENRM_VLLM_PYTHON:-/usr/local/bin/python}"
+
 # NM4's MTP head exists (mtp_num_layers 2) but speculative decoding has never
 # been exercised on it through the vLLM fork. Off for a first run; it is a
 # throughput knob, not a correctness one.
