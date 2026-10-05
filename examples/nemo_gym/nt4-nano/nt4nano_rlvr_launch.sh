@@ -126,6 +126,12 @@ export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 # the flag makes that explicit rather than incidental.
 _nt4_mounts=(
   "${SCRIPT_DIR}:/opt/nemo-rl/examples/nemo_gym/nt4-nano"
+  # The checkout at its own path, not just overlaid onto /opt/nemo-rl. The
+  # external pools' load balancer runs with --container-workdir=$SLURM_SUBMIT_DIR
+  # -- the directory sbatch was invoked from, which is this repo -- so pyxis
+  # fails task_init with "couldn't chdir" unless that path resolves inside the
+  # container. The NM4 pipeclean launcher self-mounts for the same reason.
+  "${PROJECT_ROOT}:${PROJECT_ROOT}"
   "$(dirname "${MODEL_PATH}"):$(dirname "${MODEL_PATH}"):ro"
   "$(dirname "${GENRM_MODEL}"):$(dirname "${GENRM_MODEL}"):ro"
   "$(dirname "${NL2BASH_JUDGE_MODEL}"):$(dirname "${NL2BASH_JUDGE_MODEL}"):ro"
