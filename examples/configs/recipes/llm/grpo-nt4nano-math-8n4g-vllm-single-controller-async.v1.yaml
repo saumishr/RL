@@ -76,6 +76,20 @@ policy:
     # extra activation memory from each rank now holding a whole 8192-token
     # sequence rather than a sixteenth of one.
     context_parallel_size: 1
+    # The refit that follows a training step has to find a few GiB of packed
+    # broadcast buffer on a rank already holding the model, Muon's state and
+    # the gradient buffers. Level 2 is the only level that calls empty_cache()
+    # at the end of the step, right before that refit; at level 1 the step left
+    # 4.6 GiB reserved-but-unallocated and the 3.7 GiB buffer had 1.1 GiB to
+    # fit in. The first refit survives either way because it runs before the
+    # optimizer state exists, which is why this only shows up at step 1.
+    empty_unused_memory_level: 2
+    env_vars:
+      # Pairs with the above: empty_cache() returns whole cached blocks, so
+      # whatever is still fragmented across live allocations stays stranded.
+      # Expandable segments keep the training allocations from carving the
+      # arena up in the first place.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     model_overrides:
       # FlashAttention 4 cannot run here at all: its SM100 head_dim 256 kernel
       # calls quack.activation.sub_packed_f32x2, and the image's quack-kernels
