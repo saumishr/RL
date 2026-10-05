@@ -35,11 +35,25 @@ policy:
   # directory, which carries tokenizer.json and tokenizer_config.json, so
   # AutoTokenizer loads it fine without the image side.
   is_vlm: false
-  # Sequence packing pads each sequence to this multiple, and Megatron needs
-  # the pad factor to cover cp_size * 2 -- 32 at the CP 16 this recipe trains
-  # with. The root text config leaves it at 1 because it trains without
-  # context parallelism.
+  # Megatron needs the pad factor to cover cp_size * 2 -- 32 at the CP 16 this
+  # recipe trains with. The root text config leaves it at 1 because it trains
+  # without context parallelism.
   make_sequence_length_divisible_by: 32
+  sequence_packing:
+    # Off because no attention backend in this image can train NM4's head_dim
+    # 256 on packed sequences. Asking Transformer Engine directly (see
+    # pipeclean-v2/nm4-bridge/probe_attn_backend.py) gives, for context
+    # parallelism at head_dim 256:
+    #   cuDNN  -- forward only; the backward reports no supporting backend,
+    #             for thd and sbhd alike. At head_dim 128 it trains fine, so
+    #             the head dimension is the constraint.
+    #   FA4    -- offered for everything, but its SM100 forward kernel asserts
+    #             on seqused_q/seqused_k, which only thd supplies.
+    # So FlashAttention 4 is the one backend that can train this model, and it
+    # can only do so unpacked. Padding to 8192 wastes throughput; correctness
+    # and a completed step matter more for a pipeclean. Revisit when cuDNN
+    # grows a head_dim 256 backward or FA4 accepts seqused on SM100.
+    enabled: false
   # Both training and generation now name the real NM4 HF export. The parent
   # points this at an unrelated stand-in because AutoConfig cannot read
   # model_type "nemotron4" and AutoBridge has no NM4 mapping; both gaps are
@@ -47,26 +61,6 @@ policy:
   # imports. The export is only ever read for its config and parameter names --
   # weights still come from the megatron_bridge checkpoint.
   model_name: ${oc.env:NT4_NANO_HF_CKPT,/lustre/fsw/portfolios/nemotron/users/tbarnatan/models/nm4/nemotron4-nano-wsm-vlm}
-  megatron_cfg:
-    # The parent asks for flash, which on Blackwell resolves to FlashAttention 4.
-    # Its SM100 forward kernel refuses seqused_q/seqused_k at head_dim 256 --
-    # exactly NM4's head_dim -- and sequence packing plus context parallelism
-    # always supplies those, so every attention layer aborts in
-    # flash_attn/cute/interface.py. TE's backend selection does not know about
-    # the restriction, so it cannot fall back on its own. cuDNN carries no such
-    # limit and supports thd with context parallelism and no_bias.
-    attention_backend: fused
-    model_overrides:
-      saved_args:
-        # The provider builds three configs in one process -- language, Pixtral
-        # tower, projector -- and Megatron's set_attention_backend writes the
-        # NVTE_* variables, which are process-wide, from each in turn. It
-        # asserts rather than overwrite a conflicting value, so the vision
-        # encoder has to agree with the language model above. This run never
-        # runs the tower (text-only, and vLLM discards it), so the backend it
-        # is built with is immaterial beyond matching.
-        attention_backend: fused
-        mimo_vision_encoder_attention_backend: fused
   generation:
     backend: "vllm"
     # The parent pins refit_transport=mcore, which moves weights Megatron to
