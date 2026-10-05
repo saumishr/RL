@@ -76,32 +76,36 @@ policy:
     # rank now holding a whole 8192-token sequence rather than a sixteenth of
     # one.
     context_parallel_size: 1
-    # The parent recomputes selectively, which is the right trade when CP 16
-    # splits the sequence 16 ways. Here one rank carries the whole 8192 tokens
-    # and has no tensor parallelism to spread the dense activations over
-    # either, so the forward ran out on a 22 MiB allocation with 161 GiB live
-    # -- and only from step 1, once the optimizer state existed alongside it.
+    # EP 16 is what the NM4 team and the Super 3.5 runs use; this run cannot
+    # afford it. Per local expert parameter a rank pays ~6 bytes that expert
+    # parallelism shards and data parallelism does not -- the bf16 weights and
+    # the fp32 gradient buffer, the latter because grad_reduce_in_fp32 is on --
+    # plus ~8 bytes of optimizer state that the distributed optimizer does
+    # shard, across expert-DP. At EP 16 on 64 training GPUs that is ~8 bytes a
+    # parameter and the step-1 forward dies with 161.3 GiB live. At EP 64 it is
+    # ~3.5. Measured, not assumed: going from 16 to 64 training GPUs at a fixed
+    # EP 16 moved the figure 164.2 -> 161.3 GiB, and widening selective
+    # recompute from four modules to seven moved it 161.32 -> 161.30, which is
+    # what says the residency is expert-sharded parameters rather than
+    # activations.
     #
-    # Full recompute, which is what the Super 3.5 runs use, is not available:
-    # NM4 sets moe_shortcut_connection and transformer_config.py rejects the
-    # pair outright. The same flag also bars "moe" from the selective list.
-    # So the list grows instead. shortcut_pre_mlp_layernorm is the interesting
-    # addition -- it is gated on moe_shortcut_connection being True, i.e. it
-    # exists for exactly this architecture, and the parent never claimed it.
-    # layernorm and mlp cover the dense layers the parent left resident.
-    # core_attn is deliberately absent: MCore warns it is pointless when
-    # Transformer Engine supplies a fused attention, which it does here.
-    recompute_modules:
-      - residual_stream
-      - moe_act
-      - gdp_in_proj
-      - gdp_qkv
-      - shortcut_pre_mlp_layernorm
-      - layernorm
-      - mlp
-    # Also from Super 3.5. The fp32 logits for 8192 tokens over NM4's vocab are
-    # several GiB on their own; deferring the cast keeps them bf16 until the
-    # loss needs otherwise.
+    # 512 experts divide 64 ways into 8 a rank. The cost is that every MoE
+    # all-to-all now spans all 16 training nodes instead of staying inside
+    # four, and that expert-DP falls to 1 so the optimizer state stops
+    # sharding -- both already priced into the ~3.5 above.
+    expert_model_parallel_size: 64
+    # The parent's selective recompute list is inherited unchanged, on
+    # evidence. Full recompute is not even legal here -- NM4 sets
+    # moe_shortcut_connection and transformer_config.py rejects the pair, and
+    # the same flag bars "moe" from the selective list -- but more to the
+    # point, widening the list to seven modules (adding the architecture's own
+    # shortcut_pre_mlp_layernorm, plus layernorm and mlp) moved per-rank
+    # residency by 20 MiB in 161 GiB. Activations are not what fills this card,
+    # so the extra recompute was pure compute cost. See expert parallelism
+    # above for what actually moves the number.
+    #
+    # defer_fp32_logits stays because the Super 3.5 runs set it and it costs
+    # nothing, not because it was measured to help.
     defer_fp32_logits: true
     # The refit that follows a training step has to find a few GiB of packed
     # broadcast buffer on a rank already holding the model, Muon's state and
