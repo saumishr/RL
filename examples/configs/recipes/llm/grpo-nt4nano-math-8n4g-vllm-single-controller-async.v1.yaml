@@ -35,6 +35,11 @@ policy:
   # directory, which carries tokenizer.json and tokenizer_config.json, so
   # AutoTokenizer loads it fine without the image side.
   is_vlm: false
+  # Sequence packing pads each sequence to this multiple, and Megatron needs
+  # the pad factor to cover cp_size * 2 -- 32 at the CP 16 this recipe trains
+  # with. The root text config leaves it at 1 because it trains without
+  # context parallelism.
+  make_sequence_length_divisible_by: 32
   # Both training and generation now name the real NM4 HF export. The parent
   # points this at an unrelated stand-in because AutoConfig cannot read
   # model_type "nemotron4" and AutoBridge has no NM4 mapping; both gaps are
