@@ -33,6 +33,19 @@ PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/../../..")"
 
 export CONFIG_PATH="examples/nemo_gym/nt4-nano/rlvr.yaml"
 
+# Run from the live checkout rather than an rsync snapshot. The Megatron-Bridge
+# pin this branch carries has dangling symlinks under its nested Megatron-LM
+# test tree, which rsync reports as errors and which abort the snapshot. The
+# NM4 pipeclean launcher has always mounted the checkout live for the same
+# reason. Set USE_SNAPSHOT=1 once that pin is fixed if submission-time
+# immutability is wanted.
+export USE_SNAPSHOT="${USE_SNAPSHOT:-0}"
+
+# Lightning's launcher passes its own logger overrides on the command line, so
+# the project set in rlvr.yaml would lose and these runs would file themselves
+# under Lightning's. Name it here instead.
+export WANDB_PROJ="${WANDB_PROJ:-nemo-rl-nt4nano}"
+
 # -----------------------------------------------------------------------------
 # Policy
 # -----------------------------------------------------------------------------
@@ -118,6 +131,22 @@ _joined="$(
   printf '%s' "${_nt4_mounts[*]}"
 )"
 export EXTRA_MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${_joined}"
+
+# -----------------------------------------------------------------------------
+# Stage the external vLLM pool tooling onto shared storage
+# -----------------------------------------------------------------------------
+# The judge pools run in a second Slurm hetgroup, outside the Ray cluster, so
+# they read this tooling straight off the shared filesystem rather than through
+# a container mount. A repo checked out under /home is not reachable that way,
+# so copy it next to the run's own results.
+if [[ -z "${EXTERNAL_VLLM_TOOLS_DIR_HOST:-}" ]]; then
+  : "${RESULTS_DIR:?RESULTS_DIR is required}"
+  EXTERNAL_VLLM_TOOLS_DIR_HOST="${RESULTS_DIR}/external_gym_vllm"
+  mkdir -p "${EXTERNAL_VLLM_TOOLS_DIR_HOST}"
+  cp -r "${PROJECT_ROOT}/tools/external_gym_vllm/." "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/"
+  export EXTERNAL_VLLM_TOOLS_DIR_HOST
+  echo "  Staged external vLLM tooling: ${EXTERNAL_VLLM_TOOLS_DIR_HOST}"
+fi
 
 # -----------------------------------------------------------------------------
 # Hand off to Lightning's launcher, which owns the Slurm hetjob and the
