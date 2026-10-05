@@ -90,6 +90,18 @@ policy:
       # Expandable segments keep the training allocations from carving the
       # arena up in the first place.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # packed_tensor.py sizes the refit buffer as a fraction of the GPU's
+      # TOTAL capacity, not of what is free, and allocates num_buffers of them:
+      # the 0.02 default is 3.69 GiB x 2 on a 184 GiB GB200. After a step this
+      # rank holds ~159 GiB -- mostly the fp32 gradient buffer, which is sized
+      # by local parameter count and so shrinks with expert parallelism, not
+      # with the data parallelism more nodes provide -- leaving 2.2 GiB. The
+      # request is therefore unsatisfiable however many nodes the job gets.
+      #
+      # 0.003 asks for 0.55 GiB a buffer, 1.1 GiB in total, which fits with
+      # room to spare. The cost is more broadcast iterations over the same
+      # weights, which is wall-clock in the refit and nothing else.
+      NRL_REFIT_BUFFER_MEMORY_RATIO: '0.003'
     model_overrides:
       # FlashAttention 4 cannot run here at all: its SM100 head_dim 256 kernel
       # calls quack.activation.sub_packed_f32x2, and the image's quack-kernels
