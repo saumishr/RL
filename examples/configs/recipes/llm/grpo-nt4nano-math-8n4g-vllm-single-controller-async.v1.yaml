@@ -47,6 +47,15 @@ policy:
   # imports. The export is only ever read for its config and parameter names --
   # weights still come from the megatron_bridge checkpoint.
   model_name: ${oc.env:NT4_NANO_HF_CKPT,/lustre/fsw/portfolios/nemotron/users/tbarnatan/models/nm4/nemotron4-nano-wsm-vlm}
+  megatron_cfg:
+    # The parent asks for flash, which on Blackwell resolves to FlashAttention 4.
+    # Its SM100 forward kernel refuses seqused_q/seqused_k at head_dim 256 --
+    # exactly NM4's head_dim -- and sequence packing plus context parallelism
+    # always supplies those, so every attention layer aborts in
+    # flash_attn/cute/interface.py. TE's backend selection does not know about
+    # the restriction, so it cannot fall back on its own. cuDNN carries no such
+    # limit and supports thd with context parallelism and no_bias.
+    attention_backend: fused
   generation:
     backend: "vllm"
     # The parent pins refit_transport=mcore, which moves weights Megatron to
