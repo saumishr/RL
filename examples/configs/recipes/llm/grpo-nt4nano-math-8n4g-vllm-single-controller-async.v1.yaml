@@ -77,20 +77,28 @@ policy:
     # sequence rather than a sixteenth of one.
     context_parallel_size: 1
     model_overrides:
+      # FlashAttention 4 cannot run here at all: its SM100 head_dim 256 kernel
+      # calls quack.activation.sub_packed_f32x2, and the image's quack-kernels
+      # 0.6.5 has no packed-f32x2 helpers whatsoever. That is the same version
+      # skew that broke the vLLM router warmups, surfacing a third time.
+      # Version 2 is the only other build present (flash-attn 2.8.1, with its
+      # compiled extension), and Transformer Engine permits head_dim 256 on
+      # sm100 for it.
+      #
+      # This has to be a top-level override rather than a saved_args entry.
+      # The provider is itself the language TransformerConfig, and it picks up
+      # flash_attention_version from the *checkpoint's* args once, in
+      # __post_init__ via _transformer_config_from_args; the saved_args dict we
+      # pass here is only ever read for keys the mimo providers name
+      # explicitly, which for this field is the mimo_vision_encoder_ one alone.
+      # So saved_args.flash_attention_version is a dead key for the language
+      # model, and the checkpoint's own 4 survives.
+      flash_attention_version: 2
       saved_args:
-        # FlashAttention 4 cannot run here at all: its SM100 head_dim 256
-        # kernel calls quack.activation.sub_packed_f32x2, and the image's
-        # quack-kernels 0.6.5 has no packed-f32x2 helpers whatsoever. That is
-        # the same version skew that broke the vLLM router warmups, surfacing
-        # a third time. Version 2 is the only other build present
-        # (flash-attn 2.8.1, with its compiled extension), and Transformer
-        # Engine permits head_dim 256 on sm100 for it.
-        #
-        # Both keys move together: set_attention_backend writes NVTE_FLASH_ATTN_V*
-        # process-wide from each config it sees and asserts on disagreement,
-        # so the vision tower has to name the same version as the language
-        # model even though this run never uses it.
-        flash_attention_version: 2
+        # set_attention_backend writes NVTE_FLASH_ATTN_V* process-wide from
+        # each config it sees and asserts on disagreement, so the vision tower
+        # has to name the same version as the language model even though this
+        # run never uses it.
         mimo_vision_encoder_flash_attention_version: 2
   generation:
     backend: "vllm"
