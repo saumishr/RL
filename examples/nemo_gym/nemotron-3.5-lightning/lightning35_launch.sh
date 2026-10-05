@@ -826,6 +826,21 @@ ${MTP_EXTRA_ARGS} \
 ${*}"
 
 export COMMAND="${TRAIN_CMD}"
+
+# Judge-fleet bring-up is the riskiest part of a large launch and it fails for
+# reasons that have nothing to do with training: allreduce backends that reject
+# a multi-node tensor-parallel group, kernel warmups that depend on the judges'
+# GPU generation. Setting this holds the pools at their real replica count and
+# TP against a token Ray allocation, so the fleet can be proven without
+# committing a full one. The driver still has to carry every pool's URL
+# placeholder: validate_external_vllm_submission checks for them, and
+# run_in_allocation.sh substitutes the live URLs into whatever COMMAND is.
+if [[ "${EXTERNAL_VLLM_POOLS_ONLY:-0}" == "1" ]]; then
+  COMMAND="echo 'pools-only: GenRM=${GENRM_BASE_URL} NL2Bash=${NL2BASH_BASE_URL}'; sleep ${EXTERNAL_VLLM_POOLS_ONLY_HOLD:-2400}"
+  export COMMAND
+  echo "  EXTERNAL_VLLM_POOLS_ONLY=1 -- judge pools only, no training"
+fi
+
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
   validate_external_vllm_submission "${COMMAND}" "${NUM_EXTERNAL_SERVICE_NODES}"
 fi
