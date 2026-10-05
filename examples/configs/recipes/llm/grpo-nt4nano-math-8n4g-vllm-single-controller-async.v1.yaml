@@ -76,6 +76,22 @@ policy:
     # extra activation memory from each rank now holding a whole 8192-token
     # sequence rather than a sixteenth of one.
     context_parallel_size: 1
+    model_overrides:
+      saved_args:
+        # FlashAttention 4 cannot run here at all: its SM100 head_dim 256
+        # kernel calls quack.activation.sub_packed_f32x2, and the image's
+        # quack-kernels 0.6.5 has no packed-f32x2 helpers whatsoever. That is
+        # the same version skew that broke the vLLM router warmups, surfacing
+        # a third time. Version 2 is the only other build present
+        # (flash-attn 2.8.1, with its compiled extension), and Transformer
+        # Engine permits head_dim 256 on sm100 for it.
+        #
+        # Both keys move together: set_attention_backend writes NVTE_FLASH_ATTN_V*
+        # process-wide from each config it sees and asserts on disagreement,
+        # so the vision tower has to name the same version as the language
+        # model even though this run never uses it.
+        flash_attention_version: 2
+        mimo_vision_encoder_flash_attention_version: 2
   generation:
     backend: "vllm"
     # The parent pins refit_transport=mcore, which moves weights Megatron to
