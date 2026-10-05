@@ -76,6 +76,20 @@ policy:
     # rank now holding a whole 8192-token sequence rather than a sixteenth of
     # one.
     context_parallel_size: 1
+    # The parent recomputes selectively, which is the right trade when CP 16
+    # splits the sequence 16 ways. Here one rank carries the whole 8192 tokens
+    # and has no tensor parallelism to spread the dense activations over
+    # either, so the forward ran out on a 22 MiB allocation with 161 GiB live
+    # -- and only from step 1, once the optimizer state existed alongside it.
+    # Full recompute is what the Super 3.5 runs use and it keeps a single
+    # layer's activations instead of every layer's. setup.py turns this into
+    # recompute_method=uniform, recompute_num_layers=1 and stops reading the
+    # inherited recompute_modules.
+    recompute_granularity: full
+    # Also from Super 3.5. The fp32 logits for 8192 tokens over NM4's vocab are
+    # several GiB on their own; deferring the cast keeps them bf16 until the
+    # loss needs otherwise.
+    defer_fp32_logits: true
     # The refit that follows a training step has to find a few GiB of packed
     # broadcast buffer on a rank already holding the model, Muon's state and
     # the gradient buffers. Level 2 is the only level that calls empty_cache()
