@@ -46,6 +46,7 @@ from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRe
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
+    ColumnParallelMapping,
     FusedExpertMapping,
     LocalHFParamSpec,
     MegatronParamMapping,
@@ -105,6 +106,49 @@ class WideResidualLogitMapping(ReplicatedMapping):
         padded = hf_weights.new_zeros(max(_LOGIT_PAD_NUMEL, num_streams))
         padded[:num_streams] = hf_weights
         return super().hf_to_megatron(padded, megatron_module)
+
+
+class GDPPackedColumnMapping(ColumnParallelMapping):
+    """A column-parallel GDP tensor whose rows are packed per householder.
+
+    ``in_proj`` packs ``[z, V0..V2, K0..K2, Q, b0..b2, a]`` and ``conv1d``
+    packs ``[V0..V2, K0..K2, Q]``. Megatron shards each block individually --
+    hence the ``partition_sizes`` the mixer sets on these parameters -- so
+    gathering dimension 0 across tensor-parallel ranks would interleave the
+    blocks instead of concatenating them.
+
+    At TP 1 there is nothing to gather and the two layouts coincide, which is
+    the only case this supports. TP > 1 needs a ``ChunkedMapping`` subclass
+    whose ``get_shard_idx`` returns the seven (conv1d) or twelve (in_proj)
+    block ranges, in the order ``_get_conv_checkpoint_split_layout`` and
+    ``_get_in_proj_checkpoint_split_layout`` define. Raise rather than let a
+    larger TP silently permute weights.
+    """
+
+    def _reject_sharded(self) -> None:
+        if self.tp_size > 1:
+            raise NotImplementedError(
+                f"{self.megatron_param} is packed per householder and is "
+                f"sharded block-wise across {self.tp_size} tensor-parallel "
+                "ranks; converting it needs a ChunkedMapping that knows the "
+                "block layout."
+            )
+
+    def megatron_to_hf(
+        self,
+        megatron_weights: Optional[torch.Tensor],
+        megatron_module: Optional[nn.Module],
+    ) -> Dict[str, torch.Tensor]:
+        self._reject_sharded()
+        return super().megatron_to_hf(megatron_weights, megatron_module)
+
+    def hf_to_megatron(
+        self,
+        hf_weights: torch.Tensor,
+        megatron_module: nn.Module,
+    ) -> torch.Tensor:
+        self._reject_sharded()
+        return super().hf_to_megatron(hf_weights, megatron_module)
 
 
 class UnexportedMapping(MegatronParamMapping[torch.Tensor]):
@@ -173,11 +217,13 @@ def _gdp_mixer_mappings(megatron_mixer: str, hf_layer: str) -> list[MegatronPara
         ),
         # Fused in the live module and already in HF's packed order
         # [z, V0..V2, K0..K2, Q, b0..b2, a], householder-major.
-        AutoMapping(
+        GDPPackedColumnMapping(
             megatron_param=f"{megatron_mixer}.in_proj.weight",
             hf_param=f"{hf_layer}.mixer.in_proj.weight",
         ),
-        AutoMapping(
+        # A bare nn.Conv1d, so AutoMapping cannot infer a layout: the mixer
+        # marks the weight tensor-parallel, not the module.
+        GDPPackedColumnMapping(
             megatron_param=f"{megatron_mixer}.conv1d.weight",
             hf_param=f"{hf_layer}.mixer.conv1d.weight",
         ),
@@ -185,7 +231,10 @@ def _gdp_mixer_mappings(megatron_mixer: str, hf_layer: str) -> list[MegatronPara
             megatron_param=f"{megatron_mixer}.out_proj.weight",
             hf_param=f"{hf_layer}.mixer.out_proj.weight",
         ),
-        AutoMapping(
+        # Sized d_inner_local_tp and flagged tensor_model_parallel, so this
+        # shards with the heads. Stated explicitly because AutoMapping would
+        # fall through to its "anything named *Norm* is replicated" rule.
+        ColumnParallelMapping(
             megatron_param=f"{megatron_mixer}.norm.weight",
             hf_param=f"{hf_layer}.mixer.norm.weight",
         ),
