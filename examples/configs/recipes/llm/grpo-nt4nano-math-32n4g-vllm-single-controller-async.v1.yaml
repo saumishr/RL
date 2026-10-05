@@ -68,13 +68,13 @@ policy:
   # weights still come from the megatron_bridge checkpoint.
   model_name: ${oc.env:NT4_NANO_HF_CKPT,/lustre/fsw/portfolios/nemotron/users/tbarnatan/models/nm4/nemotron4-nano-wsm-vlm}
   megatron_cfg:
-    # Forced to 1 by the attention-backend situation above, not chosen. The 16
-    # training GPUs become data parallel instead, which keeps expert
-    # parallelism at 16 and, as a side effect, finally gives the distributed
-    # optimizer a data-parallel group to shard its state over -- at CP 16 the
-    # data-parallel size was 1, so it sharded over nothing. That offsets the
-    # extra activation memory from each rank now holding a whole 8192-token
-    # sequence rather than a sixteenth of one.
+    # Forced to 1 by the attention-backend situation above, not chosen. With
+    # TP1/PP1/CP1 the 64 training GPUs are all data parallel, so expert
+    # parallelism stays at the 16 the NM4 team and the Super 3.5 runs both use
+    # and the leftover factor of 4 becomes the expert-data-parallel group the
+    # distributed optimizer shards state over. That is also what pays for each
+    # rank now holding a whole 8192-token sequence rather than a sixteenth of
+    # one.
     context_parallel_size: 1
     # The refit that follows a training step has to find a few GiB of packed
     # broadcast buffer on a rank already holding the model, Muon's state and
@@ -144,7 +144,10 @@ policy:
     colocated:
       enabled: false
       resources:
-        num_nodes: 4
+        # 16 nodes, as in the Super 3.5 runs. Far more generation capacity than
+        # 64 rollouts a step needs; it is here to keep the training half at 16
+        # nodes, which is the part that was out of memory.
+        num_nodes: 16
         gpus_per_node: 4
 
 # Back to text: the parent's CLEVR overlay is replaced by the math task from
@@ -174,13 +177,21 @@ grpo:
 
 cluster:
   gpus_per_node: 4
-  # 4 training nodes (TP1 x CP16 x EP16 = 16 GPUs) plus 4 generation nodes
-  # (16 GPUs = eight TP2 vLLM replicas). Generation needs only one node for
-  # capacity, but ray.sub declares `#SBATCH --segment=8`, so Slurm requires the
-  # node count to be a multiple of 8.
-  num_nodes: 8
+  # Matches the Super 3.5 runs' footprint: 32 nodes split 16 training / 16
+  # generation.
+  #
+  # The split is what makes this fit. At 4 training nodes the 16 GPUs were all
+  # consumed by EP16, leaving an expert-data-parallel group of size 1, so the
+  # distributed optimizer had nothing to shard expert state across; each rank
+  # carried ~14 bytes per local parameter and hit 164 GiB of the 184 GiB card,
+  # with the post-step refit then unable to find even 78 MiB for its broadcast
+  # buffer. At 16 training nodes the same EP16 leaves expert-DP = 64/16 = 4, so
+  # the fp32 main weights and Muon momentum shard four ways and the per-rank
+  # figure drops to roughly 8 bytes per parameter.
+  num_nodes: 32
+  segment_size: 8
 
 logger:
-  log_dir: logs/grpo-nt4nano-math-8n4g-vllm-single-controller-async
+  log_dir: logs/grpo-nt4nano-math-32n4g-vllm-single-controller-async
   wandb:
-    name: grpo-nt4nano-math-8n4g-vllm-single-controller-async
+    name: grpo-nt4nano-math-32n4g-vllm-single-controller-async
