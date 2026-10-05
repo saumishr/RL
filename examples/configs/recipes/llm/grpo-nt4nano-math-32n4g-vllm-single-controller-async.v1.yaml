@@ -81,11 +81,24 @@ policy:
     # and has no tensor parallelism to spread the dense activations over
     # either, so the forward ran out on a 22 MiB allocation with 161 GiB live
     # -- and only from step 1, once the optimizer state existed alongside it.
-    # Full recompute is what the Super 3.5 runs use and it keeps a single
-    # layer's activations instead of every layer's. setup.py turns this into
-    # recompute_method=uniform, recompute_num_layers=1 and stops reading the
-    # inherited recompute_modules.
-    recompute_granularity: full
+    #
+    # Full recompute, which is what the Super 3.5 runs use, is not available:
+    # NM4 sets moe_shortcut_connection and transformer_config.py rejects the
+    # pair outright. The same flag also bars "moe" from the selective list.
+    # So the list grows instead. shortcut_pre_mlp_layernorm is the interesting
+    # addition -- it is gated on moe_shortcut_connection being True, i.e. it
+    # exists for exactly this architecture, and the parent never claimed it.
+    # layernorm and mlp cover the dense layers the parent left resident.
+    # core_attn is deliberately absent: MCore warns it is pointless when
+    # Transformer Engine supplies a fused attention, which it does here.
+    recompute_modules:
+      - residual_stream
+      - moe_act
+      - gdp_in_proj
+      - gdp_qkv
+      - shortcut_pre_mlp_layernorm
+      - layernorm
+      - mlp
     # Also from Super 3.5. The fp32 logits for 8192 tokens over NM4's vocab are
     # several GiB on their own; deferring the cast keeps them bf16 until the
     # loss needs otherwise.
