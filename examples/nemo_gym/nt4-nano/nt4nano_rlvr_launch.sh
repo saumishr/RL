@@ -83,14 +83,16 @@ export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fs1/portfolios/llmservi
 
 export ENABLE_EXTERNAL_VLLM=1
 
-# The judge pools run GENRM_CONTAINER, which is a vllm-openai image, not the
-# NeMo-RL container. Lightning's default interpreter is a per-actor uv venv
-# under /opt/ray_venvs that exists only in the NeMo-RL image, so every replica
-# died with "No such file or directory" before vLLM ever started. In the judge
-# image vLLM is the system interpreter's own package -- probed on this cluster
-# as vLLM 0.27.1 on Python 3.12.13 at this path, with no /opt/ray_venvs at all.
-# NL2BASH_VLLM_PYTHON defaults to this, so one setting covers both pools.
-export GENRM_VLLM_PYTHON="${GENRM_VLLM_PYTHON:-/usr/local/bin/python}"
+# Do not set GENRM_CONTAINER to a standalone vllm-openai image, however much
+# the Super 3.5 production script looks like a template for it. That script
+# orchestrates through pipeline/tools/launch.sh, not this path. Here the pools
+# run serve_vllm_on_ray.py, which imports
+# nemo_rl.models.generation.vllm.patches, and their srun mounts only
+# EXTERNAL_VLLM_SHARED_ROOT -- no repo overlay -- so nemo_rl has to be baked
+# into the image. Lightning's default of CONTAINER is therefore the right one
+# and is left alone: probed on this cluster, that image carries nemo_rl at
+# /opt/nemo-rl, vLLM 0.29.0 and the /opt/ray_venvs interpreter that
+# GENRM_VLLM_PYTHON defaults to. Overriding either one breaks both pools.
 
 # NM4's MTP head exists (mtp_num_layers 2) but speculative decoding has never
 # been exercised on it through the vLLM fork. Off for a first run; it is a
