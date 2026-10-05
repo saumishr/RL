@@ -76,7 +76,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/../../..")"
 
-CONFIG_PATH="examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml"
+CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml}"
 NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-32}"
 NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
 NUM_GYM_NODES="${NUM_GYM_NODES:-2}"
