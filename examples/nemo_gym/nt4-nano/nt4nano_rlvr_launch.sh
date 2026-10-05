@@ -83,6 +83,11 @@ export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fs1/portfolios/llmservi
 
 export ENABLE_EXTERNAL_VLLM=1
 
+# Lightning's pool definitions assume 8-GPU nodes and a pre-Blackwell judge
+# fleet. Both assumptions are wrong here, so correct them after the fact rather
+# than forking the launcher.
+export EXTERNAL_VLLM_POOL_OVERRIDES="${SCRIPT_DIR}/pool_overrides.sh"
+
 # Do not set GENRM_CONTAINER to a standalone vllm-openai image, however much
 # the Super 3.5 production script looks like a template for it. That script
 # orchestrates through pipeline/tools/launch.sh, not this path. Here the pools

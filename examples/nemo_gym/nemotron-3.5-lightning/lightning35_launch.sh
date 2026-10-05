@@ -211,6 +211,20 @@ nl2bash_vllm_args=(
 [[ "${NL2BASH_ENABLE_EXPERT_PARALLEL}" == "1" ]] && nl2bash_vllm_args+=(--enable-expert-parallel)
 external_vllm_pool_args NL2BASH "${nl2bash_vllm_args[@]}"
 
+# The pool definitions above are tuned for this deployment's GPU count and
+# device capability. Other deployments reusing this launcher need to adjust
+# them without forking it, so source an override file last: both
+# external_vllm_pool_env and external_vllm_pool_args append, and the replica
+# applies env assignments and vLLM arguments in order, so the last value wins.
+if [[ -n "${EXTERNAL_VLLM_POOL_OVERRIDES:-}" ]]; then
+  if [[ ! -f "${EXTERNAL_VLLM_POOL_OVERRIDES}" ]]; then
+    echo "ERROR: EXTERNAL_VLLM_POOL_OVERRIDES does not exist: ${EXTERNAL_VLLM_POOL_OVERRIDES}" >&2
+    exit 1
+  fi
+  echo "  Pool overrides: ${EXTERNAL_VLLM_POOL_OVERRIDES}"
+  source "${EXTERNAL_VLLM_POOL_OVERRIDES}"
+fi
+
 RAY_SUB="${RAY_SUB:-${PROJECT_ROOT}/ray.sub}"
 BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_gym_vllm/run_in_allocation.sh}"
 export \
