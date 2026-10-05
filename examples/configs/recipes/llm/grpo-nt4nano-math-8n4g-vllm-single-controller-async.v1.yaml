@@ -35,25 +35,31 @@ policy:
   # directory, which carries tokenizer.json and tokenizer_config.json, so
   # AutoTokenizer loads it fine without the image side.
   is_vlm: false
-  # Megatron needs the pad factor to cover cp_size * 2 -- 32 at the CP 16 this
-  # recipe trains with. The root text config leaves it at 1 because it trains
-  # without context parallelism.
-  make_sequence_length_divisible_by: 32
+  # No attention backend in this image can train NM4's head_dim 256 on packed
+  # sequences. Asking Transformer Engine directly (see
+  # pipeclean-v2/nm4-bridge/probe_attn_backend.py) gives, at head_dim 256:
+  #   cuDNN -- forward only. The backward reports no supporting backend, for
+  #            thd and sbhd alike; at head_dim 128 it trains, so the head
+  #            dimension is the constraint.
+  #   FA4   -- offered everywhere, but its SM100 forward kernel asserts on
+  #            seqused_q/seqused_k, which only thd supplies.
+  #   FA2   -- would take head_dim 256 on sm100, but is disabled for thd
+  #            whenever sequences are padded apart, which packing always does.
+  #   FA3   -- sm90 only.
+  # FlashAttention 4 on unpacked sequences is the one combination left. And
+  # megatron/setup.py requires packing whenever context parallelism is on,
+  # because CP needs cu_seqlens through PackedSeqParams -- so dropping packing
+  # means dropping CP with it. Both go, together, for that single reason.
+  #
+  # This is not how the NM4 team trains the model; it is what this image can
+  # run. Revisit when cuDNN grows a head_dim 256 backward or FA4 accepts
+  # seqused on SM100, at which point CP 16 and packing both come back.
   sequence_packing:
-    # Off because no attention backend in this image can train NM4's head_dim
-    # 256 on packed sequences. Asking Transformer Engine directly (see
-    # pipeclean-v2/nm4-bridge/probe_attn_backend.py) gives, for context
-    # parallelism at head_dim 256:
-    #   cuDNN  -- forward only; the backward reports no supporting backend,
-    #             for thd and sbhd alike. At head_dim 128 it trains fine, so
-    #             the head dimension is the constraint.
-    #   FA4    -- offered for everything, but its SM100 forward kernel asserts
-    #             on seqused_q/seqused_k, which only thd supplies.
-    # So FlashAttention 4 is the one backend that can train this model, and it
-    # can only do so unpacked. Padding to 8192 wastes throughput; correctness
-    # and a completed step matter more for a pipeclean. Revisit when cuDNN
-    # grows a head_dim 256 backward or FA4 accepts seqused on SM100.
     enabled: false
+  # Nothing here needs 32 once CP is gone -- Megatron's floor drops with
+  # cp_size -- but a multiple of 32 satisfies every pad factor in play and
+  # keeps the sequence length friendly to the kernels.
+  make_sequence_length_divisible_by: 32
   # Both training and generation now name the real NM4 HF export. The parent
   # points this at an unrelated stand-in because AutoConfig cannot read
   # model_type "nemotron4" and AutoBridge has no NM4 mapping; both gaps are
@@ -61,6 +67,15 @@ policy:
   # imports. The export is only ever read for its config and parameter names --
   # weights still come from the megatron_bridge checkpoint.
   model_name: ${oc.env:NT4_NANO_HF_CKPT,/lustre/fsw/portfolios/nemotron/users/tbarnatan/models/nm4/nemotron4-nano-wsm-vlm}
+  megatron_cfg:
+    # Forced to 1 by the attention-backend situation above, not chosen. The 16
+    # training GPUs become data parallel instead, which keeps expert
+    # parallelism at 16 and, as a side effect, finally gives the distributed
+    # optimizer a data-parallel group to shard its state over -- at CP 16 the
+    # data-parallel size was 1, so it sharded over nothing. That offsets the
+    # extra activation memory from each rank now holding a whole 8192-token
+    # sequence rather than a sixteenth of one.
+    context_parallel_size: 1
   generation:
     backend: "vllm"
     # The parent pins refit_transport=mcore, which moves weights Megatron to
