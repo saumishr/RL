@@ -61,6 +61,15 @@ export MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/nemotron/users/tbarnatan
 # falls back to treating it as a Hub repo id and dies on the leading slash.
 export NT4_NANO_PROCESSOR="${NT4_NANO_PROCESSOR:-/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nt4-nano-processor}"
 
+# The Megatron-Bridge dist checkpoint the policy actually initializes from, read
+# by every MegatronPolicyWorker. Same reason as the processor above: the recipe
+# inherits it as ${oc.env:NT4_NANO_CKPT_PATH,<this path>}, so naming it here is
+# what gets it mounted. Job 7753865 died at 13:08 on 86 nodes because it was
+# not, and the resulting error reads as a corrupt checkpoint rather than a
+# missing mount -- the worker reports the directory "does not contain
+# run_config.yaml", which it does, on the host.
+export NT4_NANO_CKPT_PATH="${NT4_NANO_CKPT_PATH:-/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nm4_nano_bridge}"
+
 # -----------------------------------------------------------------------------
 # Node allocation
 # -----------------------------------------------------------------------------
@@ -239,6 +248,11 @@ _nt4_mounts=(
   # The processor is its own export, so mount the directory itself rather than
   # its parent -- the parent also holds the dist checkpoint and the 128B model.
   "${NT4_NANO_PROCESSOR}:${NT4_NANO_PROCESSOR}:ro"
+  # Read-write rather than ro only because that is how the text pipeclean had it
+  # (it mounted the whole user tree rw) and that configuration is known to load
+  # this checkpoint. Loading should not need to write; tighten to :ro once a run
+  # has confirmed that.
+  "${NT4_NANO_CKPT_PATH}:${NT4_NANO_CKPT_PATH}"
   "$(dirname "${GENRM_MODEL}"):$(dirname "${GENRM_MODEL}"):ro"
   "$(dirname "${NL2BASH_JUDGE_MODEL}"):$(dirname "${NL2BASH_JUDGE_MODEL}"):ro"
   "$(dirname "${TRAIN_PATH}"):$(dirname "${TRAIN_PATH}")"
@@ -264,6 +278,28 @@ for _nt4_shared in "${RESULTS_DIR:-}" "${PERSISTENT_CACHE:-}"; do
   _nt4_mounts+=("${_nt4_shared}:${_nt4_shared}")
 done
 unset _nt4_shared _nt4_existing
+
+# Fail on a mistyped or moved path here rather than after a queue wait. Each of
+# these is mounted from its own value above, so this checks that the path really
+# exists on the host -- it deliberately does not claim to check mount coverage,
+# which for these variables is true by construction.
+#
+# What this cannot catch is the failure that cost job 7753865 its 86 nodes: a
+# path the recipe YAML names via oc.env that the launcher never names at all,
+# and so never mounts. Being absent from this list was the bug. Detecting that
+# needs the resolved config, so the check lives in the one-node preflight, which
+# walks every /lustre path in the resolved MasterConfig against this mount list.
+for _nt4_path_var in MODEL_PATH NT4_NANO_PROCESSOR NT4_NANO_CKPT_PATH \
+                     GENRM_MODEL NL2BASH_JUDGE_MODEL SAFETY_JUDGE_MODEL \
+                     TRAIN_PATH VAL_PATH; do
+  _nt4_path="${!_nt4_path_var:-}"
+  [[ -n "${_nt4_path}" ]] || continue
+  if [[ ! -e "${_nt4_path}" ]]; then
+    echo "ERROR: ${_nt4_path_var} does not exist on the host: ${_nt4_path}" >&2
+    exit 1
+  fi
+done
+unset _nt4_path_var _nt4_path
 
 _joined="$(
   IFS=,
