@@ -169,6 +169,22 @@ if [[ "$(dirname "${SAFETY_JUDGE_MODEL}")" != "$(dirname "${NL2BASH_JUDGE_MODEL}
   _nt4_mounts+=("$(dirname "${SAFETY_JUDGE_MODEL}"):$(dirname "${SAFETY_JUDGE_MODEL}"):ro")
 fi
 
+# RESULTS_DIR holds ray.sub's log dir and the checkpoint tree, and both halves of
+# the job read it from inside the container: the head and every worker gate on
+# signal files there, starting with the .shared_fs_canary that proves the
+# directory really is shared. Since none of /lustre is mounted by default, a
+# RESULTS_DIR outside the paths above means all 66 containers fail that check
+# the moment they start and ray.sub tears the job down. PERSISTENT_CACHE is the
+# same story for the HF and FlashInfer caches.
+for _nt4_shared in "${RESULTS_DIR:-}" "${PERSISTENT_CACHE:-}"; do
+  [[ -n "${_nt4_shared}" ]] || continue
+  for _nt4_existing in "${_nt4_mounts[@]}"; do
+    [[ "${_nt4_existing%%:*}" == "${_nt4_shared}" ]] && continue 2
+  done
+  _nt4_mounts+=("${_nt4_shared}:${_nt4_shared}")
+done
+unset _nt4_shared _nt4_existing
+
 _joined="$(
   IFS=,
   printf '%s' "${_nt4_mounts[*]}"
