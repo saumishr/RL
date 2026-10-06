@@ -129,26 +129,12 @@ policy:
     # tensor was half the size and fit.
     mtp_num_layers: 0
     mtp_loss_scaling_factor: 0.0
-    # Setting mtp_num_layers alone does not remove MTP from this model, and that
-    # is not a subtlety -- hybrid_provider.py says so outright: "When
-    # mtp_use_repeated_layer=True, the shared MTP layer always exists in the
-    # model and mtp_num_layers controls forward pass repetitions." It builds
-    # max(1, mtp_num_layers or 0) copies, so 0 still yields one. The block then
-    # exists, mtp_process is True, and the forward enters the MTP branch -- but
-    # experimental_nm4_llava_provider.py has already set lm_input_ids to None,
-    # because it drops the pre-merge token IDs whenever mtp_num_layers is not
-    # positive. The two disagree and MCore asserts on
-    # mtp_inputs.input_ids is not None. Job 7760876 died there, having cleared
-    # the OOM this block was added for.
-    #
-    # With repeated layers off, num_pattern_copies is 0, no MTP block is built,
-    # mtp_process is False, and the provider dropping input_ids becomes
-    # correct rather than contradictory.
-    #
-    # Note this is why grpo-nanov3-30ba3b can keep mtp_use_repeated_layer true
-    # next to mtp_num_layers 0: that path only runs when the provider defines
-    # mtp_hybrid_override_pattern, which NM4 does and nanov3 does not.
-    mtp_use_repeated_layer: false
+    # mtp_use_repeated_layer is deliberately left at the inherited true. Setting
+    # it false does not remove MTP, it changes the MTP layers from one shared
+    # repeated layer into one distinct layer per depth -- weights this
+    # checkpoint does not contain. Job 7761548 died on exactly that:
+    # KeyError "language_model.mtp.layers.1...linear_fc1.weight from model not
+    # in state dict".
 
     # mtp_hsm has to travel by a different road than the two keys above. MCore
     # raises "mtp_hsm=True requires mtp_num_layers >= 2", and
@@ -173,6 +159,32 @@ policy:
     # mtp_num_layers in (None, 0, 1).
     model_overrides:
       mtp_hsm: false
+
+      # This is what actually removes MTP, and nothing in the mtp_* keys can do
+      # it. The depths are baked into the provider's pattern constant, whose
+      # format is "<main>/<mtp>/<mtp>":
+      #
+      #   NEMOTRON4_NANO_HYBRID_LAYER_PATTERN = "...*EMEM-M-/*E/*E"
+      #
+      # The num_pattern_copies logic that mtp_num_layers feeds only runs when
+      # the provider sets mtp_hybrid_override_pattern, and NM4 does not -- so
+      # the constant is used verbatim and the two "*E" depths are built no
+      # matter what mtp_num_layers says. Three 86-node runs died downstream of
+      # that: 7758485 on the MTP loss buffer, 7760876 on the MTP branch running
+      # without input_ids, 7761548 on MTP weights that do not exist.
+      #
+      # Dropping the separator and everything after it leaves the main decoder
+      # byte-for-byte identical -- 72 layers before and after, 76 only when the
+      # four MTP layers are counted -- so this removes the MTP blocks and
+      # changes nothing else. parse_hybrid_pattern on a pattern with no "/"
+      # returns mtp_num_depths=0, which is the documented way to say "no MTP".
+      # The checkpoint keeps its MTP weights; Megatron's distributed load asks
+      # for the model's keys, so unrequested ones are simply ignored.
+      #
+      # MTP has to go rather than merely be cheaper: the vLLM container this
+      # run generates with does not support MTP, so those weights could not be
+      # consumed on the generation side even if training produced them.
+      hybrid_layer_pattern: "M-M-M*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEM-M-"
 
   generation:
     # The parent's 1024 is a math-pipeclean budget. Judged RLVR responses carry
