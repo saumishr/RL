@@ -129,6 +129,26 @@ policy:
     # tensor was half the size and fit.
     mtp_num_layers: 0
     mtp_loss_scaling_factor: 0.0
+    # Setting mtp_num_layers alone does not remove MTP from this model, and that
+    # is not a subtlety -- hybrid_provider.py says so outright: "When
+    # mtp_use_repeated_layer=True, the shared MTP layer always exists in the
+    # model and mtp_num_layers controls forward pass repetitions." It builds
+    # max(1, mtp_num_layers or 0) copies, so 0 still yields one. The block then
+    # exists, mtp_process is True, and the forward enters the MTP branch -- but
+    # experimental_nm4_llava_provider.py has already set lm_input_ids to None,
+    # because it drops the pre-merge token IDs whenever mtp_num_layers is not
+    # positive. The two disagree and MCore asserts on
+    # mtp_inputs.input_ids is not None. Job 7760876 died there, having cleared
+    # the OOM this block was added for.
+    #
+    # With repeated layers off, num_pattern_copies is 0, no MTP block is built,
+    # mtp_process is False, and the provider dropping input_ids becomes
+    # correct rather than contradictory.
+    #
+    # Note this is why grpo-nanov3-30ba3b can keep mtp_use_repeated_layer true
+    # next to mtp_num_layers 0: that path only runs when the provider defines
+    # mtp_hybrid_override_pattern, which NM4 does and nanov3 does not.
+    mtp_use_repeated_layer: false
 
     # mtp_hsm has to travel by a different road than the two keys above. MCore
     # raises "mtp_hsm=True requires mtp_num_layers >= 2", and
