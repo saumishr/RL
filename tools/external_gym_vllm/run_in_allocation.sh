@@ -509,7 +509,11 @@ bash -n <(printf '%s' "${VLLM_SERVER_BODY}") || {
 
 ray_head_node="${ray_nodes[0]}"
 lb_mounts="${MOUNTS},${EXTERNAL_VLLM_TOOLS_DIR_HOST}:/opt/external-vllm-tools:ro"
-external_service_mount="${EXTERNAL_VLLM_SHARED_ROOT}:${EXTERNAL_VLLM_SHARED_ROOT}"
+# The pools run serve_vllm_on_ray.py, which is NeMo RL code calling NeMo RL's
+# vLLM source patches. Without MOUNTS they resolve those against the container's
+# built-in /opt/nemo-rl while the training side resolves them against the
+# overlay, so a patch the run depends on silently applies to one half of the job.
+external_service_mount="${EXTERNAL_VLLM_SHARED_ROOT}:${EXTERNAL_VLLM_SHARED_ROOT}${MOUNTS:+,${MOUNTS}}"
 for pool in "${pool_names[@]}"; do
   lb_mounts+=",${state_dirs[${pool}]}:${lb_state_dirs[${pool}]}"
 done
