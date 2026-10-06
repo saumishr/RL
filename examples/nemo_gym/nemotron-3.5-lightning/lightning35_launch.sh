@@ -775,7 +775,17 @@ export SETUP_COMMAND
 # Stage-specific hyperparameters (batch sizes, advantage clip, MoE parallelism,
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
+#
+# The runner is a knob because the two are not interchangeable and the config
+# decides which one is valid. run_grpo_nemo_gym.py is the legacy path: it
+# dereferences `grpo.async_grpo.enabled` unguarded, so it requires that block.
+# run_grpo_single_controller.py is the v2 path: it *rejects* a non-null
+# `grpo.async_grpo` ("use `async_rl.*` instead"), requires
+# `data_plane.enabled=true`, and supports NeMo-Gym through
+# setup_nemo_gym_config. A single-controller recipe therefore cannot run on the
+# legacy runner, and vice versa. Default stays legacy so Lightning is unchanged.
 # =============================================================================
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 if compgen -G \"${RUN_DIR}/setup_failures/vllm_patch_*\" >/dev/null; then \
   echo '[VLLM PATCH] ERROR: setup failed on one or more nodes:' >&2; \
@@ -802,7 +812,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=\${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+uv run ${TRAIN_SCRIPT} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \

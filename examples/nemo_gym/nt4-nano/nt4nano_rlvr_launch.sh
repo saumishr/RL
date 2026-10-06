@@ -41,6 +41,26 @@ export CONFIG_PATH="examples/nemo_gym/nt4-nano/rlvr.yaml"
 # immutability is wanted.
 export USE_SNAPSHOT="${USE_SNAPSHOT:-0}"
 
+# This recipe is a v2 single-controller config, so it has to run on the
+# single-controller runner. Lightning's default is the legacy
+# run_grpo_nemo_gym.py, and the two are mutually exclusive by design:
+#
+#   - the legacy runner dereferences `config.grpo.async_grpo.enabled` with no
+#     None guard, so it requires that block to exist;
+#   - the SC runner raises "SC requires `grpo.async_grpo: null`; use
+#     `async_rl.*` instead" if it does.
+#
+# The inherited recipe nulls async_grpo and configures async_rl and
+# data_plane.enabled instead, which is what the text pipeclean ran. On the
+# legacy runner that config is simply unrunnable: job 7757138 got all the way
+# through checkpoint load, the judge fleet, the refit rendezvous
+# (world_size=256 train_world_size=128) and CUDA graph capture, then died on
+# `AttributeError: 'NoneType' object has no attribute 'enabled'`.
+#
+# The SC runner supports gym through setup_nemo_gym_config, so this is a runner
+# swap and not a reduction in scope.
+export TRAIN_SCRIPT="${TRAIN_SCRIPT:-./examples/run_grpo_single_controller.py}"
+
 # Lightning's launcher passes its own logger overrides on the command line, so
 # the project set in rlvr.yaml would lose and these runs would file themselves
 # under Lightning's. Name it here instead.
