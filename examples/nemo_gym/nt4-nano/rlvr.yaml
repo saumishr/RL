@@ -147,12 +147,16 @@ data:
   shuffle: true
   num_workers: 1
   train:
-    # Only data_path, as in the Lightning recipe. data.default already names
-    # NemoGymDataset, and naming dataset_name or split_validation_size here --
-    # even as null -- is not a way to clear the parent's choice: data.train is
-    # validated against a union of dataset configs that requires a str and a
-    # float respectively, so a null fails every branch and the driver dies in
-    # config validation before it reaches the cluster.
+    # Name the class here, not just in data.default: update_single_dataset_config
+    # only fills keys that are absent, so the parent math recipe's
+    # dataset_name wins and data_path is silently dropped as an unsupported key
+    # for OpenMathInstruct2Dataset -- which trains on 14M math rows instead of
+    # this file. Clearing it with null does not work either, since data.train is
+    # validated against a union of dataset configs that requires a str.
+    # The parent's split_validation_size and seed ride along harmlessly:
+    # NemoGymDataset takes **kwargs and never splits, and validation is explicit
+    # below.
+    dataset_name: NemoGymDataset
     data_path: null   # set by the launch script
   validation:
     data_path: null   # set by the launch script
