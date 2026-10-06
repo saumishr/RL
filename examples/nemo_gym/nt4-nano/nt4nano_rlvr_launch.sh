@@ -172,6 +172,19 @@ export VAL_PATH="${VAL_PATH:-${TRAIN_PATH}}"
 # Checkpoints are mounted read-only at their own paths so the config can name
 # them literally. They belong to other users and are read-only to us anyway;
 # the flag makes that explicit rather than incidental.
+
+# An uninitialised submodule would mount an empty directory over the image's
+# working bridge, which fails the same way as not mounting it at all but 66
+# nodes later. The text pipeclean launcher preflights this same file.
+_nt4_provider="${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src/megatron/bridge/models/experimental_nm4_llava_provider.py"
+if [[ ! -f "${_nt4_provider}" ]]; then
+  echo "ERROR: NM4 bridge provider missing: ${_nt4_provider}" >&2
+  echo "  Initialize it with: git submodule update --init --recursive \\" >&2
+  echo "    3rdparty/Megatron-Bridge-workspace/Megatron-Bridge" >&2
+  exit 1
+fi
+unset _nt4_provider
+
 _nt4_mounts=(
   "${SCRIPT_DIR}:/opt/nemo-rl/examples/nemo_gym/nt4-nano"
   # The checkout at its own path, not just overlaid onto /opt/nemo-rl. The
@@ -180,6 +193,30 @@ _nt4_mounts=(
   # fails task_init with "couldn't chdir" unless that path resolves inside the
   # container. The NM4 pipeclean launcher self-mounts for the same reason.
   "${PROJECT_ROOT}:${PROJECT_ROOT}"
+  # Megatron-Bridge has to come from this checkout, not the image. Two separate
+  # things break without it, and both killed job 7746306 at the first policy
+  # worker -- after the sandbox, the dataset, the config and all eight judge
+  # pools had finally come up clean:
+  #
+  #   1. The NM4 provider this branch adds (experimental_nm4_llava_provider,
+  #      imported by nemo_rl/models/megatron/nemotron4/__init__.py) does not
+  #      exist in the image's bridge, which predates it.
+  #   2. The image's nested Megatron-LM is a newer Mistral fork whose
+  #      megatron/training/training.py imports mistral_adapter
+  #      unconditionally, and that chain ends at a bare `import cv2`. NeMo-RL
+  #      excludes OpenCV from the image on purpose (pyproject pins it to
+  #      `sys_platform == 'never'` over FFmpeg codec royalties), so importing
+  #      megatron.training there cannot work. This checkout's Megatron-LM has
+  #      no such import, so the question never arises.
+  #
+  # One mount fixes both because Megatron-LM is nested inside Megatron-Bridge
+  # at 3rdparty/Megatron-LM, which is where the image resolves `megatron` from.
+  #
+  # The text pipeclean got this by overlaying the whole repo at /opt/nemo-rl.
+  # Lightning deliberately mounts piecewise instead and documents this exact
+  # container path as an EXTRA_MOUNTS override, so narrow the substitution to
+  # the one tree that actually differs rather than re-overlaying everything.
+  "${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
   "$(dirname "${MODEL_PATH}"):$(dirname "${MODEL_PATH}"):ro"
   # The processor is its own export, so mount the directory itself rather than
   # its parent -- the parent also holds the dist checkpoint and the 128B model.
