@@ -99,18 +99,24 @@ export EXTERNAL_VLLM_POOL_OVERRIDES="${SCRIPT_DIR}/pool_overrides.sh"
 # /opt/nemo-rl, vLLM 0.29.0 and the /opt/ray_venvs interpreter that
 # GENRM_VLLM_PYTHON defaults to. Overriding either one breaks both pools.
 
-# The sandbox master builds one nginx config listing every peer node as an
-# upstream, and nginx resolves all of them at config-test time. A single
-# transient lookup failure anywhere in that list aborts the test, so
+# In multi-node mode the sandbox master builds one nginx config listing every
+# peer node as an upstream, and nginx resolves all of them at config-test time.
+# A single transient lookup failure anywhere in that list aborts the test, so
 # start-with-nginx.sh exits, ray.sub sees a background srun die and tears the
 # whole job down -- which killed an 86-node allocation 2 minutes in after one
-# node failed to resolve. Retry instead: the script is a server that never
-# returns on success, so any return is a failure worth another attempt, and a
-# second config test re-resolves the name. Clear the first attempt's uwsgi
-# workers first or the retry lands on ports they still hold; the pattern below
-# matches exactly how the script spawns them. Three attempts fit inside the
-# 300s readiness deadline ray.sub gives each sandbox task.
-export SANDBOX_COMMAND="${SANDBOX_COMMAND:-_try=0; while :; do _try=\$((_try+1)); /start-with-nginx.sh; _rc=\$?; if [ \"\$_try\" -ge 3 ]; then echo \"[FATAL] sandbox exited rc=\$_rc on attempt \$_try; giving up\" >&2; exit \"\$_rc\"; fi; echo \"[WARN] sandbox exited rc=\$_rc on attempt \$_try; clearing workers and retrying\" >&2; pkill -f \"uwsgi --ini /tmp/worker\" || true; sleep 5; done}"
+# node failed to resolve. Nothing here needs a cross-node sandbox: every
+# resource server in config_paths is judge- or rule-based, and the agents that
+# would use the sandbox are filtered out of the dataset. Forcing single-node
+# mode keeps each node's upstreams on 127.0.0.1, so no peer name is ever
+# resolved and the failure mode is gone rather than merely survivable.
+#
+# The retry stays as a cheap backstop for any other transient startup failure.
+# The script is a server that never returns on success, so any return is worth
+# another attempt. Clear the previous attempt's uwsgi workers first or the
+# retry lands on ports they still hold; the pattern below matches exactly how
+# the script spawns them. Three attempts fit inside the 300s readiness deadline
+# ray.sub gives each sandbox task.
+export SANDBOX_COMMAND="${SANDBOX_COMMAND:-_try=0; while :; do _try=\$((_try+1)); SANDBOX_FORCE_SINGLE_NODE=1 /start-with-nginx.sh; _rc=\$?; if [ \"\$_try\" -ge 3 ]; then echo \"[FATAL] sandbox exited rc=\$_rc on attempt \$_try; giving up\" >&2; exit \"\$_rc\"; fi; echo \"[WARN] sandbox exited rc=\$_rc on attempt \$_try; clearing workers and retrying\" >&2; pkill -f \"uwsgi --ini /tmp/worker\" || true; sleep 5; done}"
 
 # NM4's MTP head exists (mtp_num_layers 2) but speculative decoding has never
 # been exercised on it through the vLLM fork. Off for a first run; it is a
