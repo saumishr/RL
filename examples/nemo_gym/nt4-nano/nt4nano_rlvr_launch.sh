@@ -142,6 +142,24 @@ _nt4_pgrep_shim="mkdir -p /tmp/nrl-shim && { echo \"#!/bin/sh\"; echo \"grep -l 
 export SANDBOX_COMMAND="${SANDBOX_COMMAND:-${_nt4_pgrep_shim}; PATH=/tmp/nrl-shim:\$PATH SANDBOX_FORCE_SINGLE_NODE=1 /start-with-nginx.sh}"
 unset _nt4_pgrep_shim
 
+# Mounting Megatron-Bridge from this checkout (see the mounts below) also
+# replaces that subtree's pyproject.toml and uv.lock, and the root project
+# depends on it as an editable path. That makes uv consider the lock stale, so
+# the driver's `uv run` tries to re-resolve the whole dependency graph, reaches
+# a private GitLab index it has no credentials for, and fails -- which is how
+# job 7752254 died seven minutes in, taking 86 nodes with it.
+#
+# Nothing needs resolving: the image already ships the environment, and the
+# mount only swaps Python source behind editable finders that map
+# megatron.core and megatron.bridge into that tree. The text pipeclean launcher
+# passes `uv run --no-sync` for exactly this reason while overlaying even more
+# of the repo. Lightning builds its own `uv run` without that flag, so set the
+# environment equivalent here rather than forking its command construction.
+#
+# Worker venvs are unaffected: they are pre-materialized under /opt/ray_venvs,
+# so create_local_venv returns early and never invokes uv at all.
+export UV_NO_SYNC="${UV_NO_SYNC:-1}"
+
 # NM4's MTP head exists (mtp_num_layers 2) but speculative decoding has never
 # been exercised on it through the vLLM fork. Off for a first run; it is a
 # throughput knob, not a correctness one.
