@@ -106,26 +106,41 @@ export EXTERNAL_VLLM_POOL_OVERRIDES="${SCRIPT_DIR}/pool_overrides.sh"
 # /opt/nemo-rl, vLLM 0.29.0 and the /opt/ray_venvs interpreter that
 # GENRM_VLLM_PYTHON defaults to. Overriding either one breaks both pools.
 
-# In multi-node mode the sandbox master builds one nginx config listing every
-# peer node as an upstream, and nginx resolves all of them when it validates
-# that config. A single transient lookup failure aborts the test before the
-# master ever reports ready, so start-with-nginx.sh exits non-zero, srun's
-# --kill-on-bad-exit fires, and ray.sub tears the whole job down -- which
-# killed an 86-node allocation 2 minutes in after one node failed to resolve.
+# Two independent defects have to be worked around here, and the sandbox is now
+# load-bearing: ns_tools, code_gen and terminus_judge all call it, so it is no
+# longer acceptable for it to merely start.
 #
-# Nothing here needs a cross-node sandbox: every resource server in
-# config_paths is judge- or rule-based, and filter_rlvr_by_length.py drops the
-# agents that would use one. Single-node mode keeps each node's upstreams on
-# 127.0.0.1, so no peer name is ever resolved.
+# First, in multi-node mode the sandbox master builds one nginx config listing
+# every peer node as an upstream, and nginx resolves all of them when it
+# validates that config. A single transient lookup failure aborts the test
+# before the master reports ready, so start-with-nginx.sh exits non-zero, srun's
+# --kill-on-bad-exit fires, and ray.sub tears the whole job down -- which killed
+# an 86-node allocation 2 minutes in after one node failed to resolve. Forcing
+# single-node mode keeps each node's upstreams on 127.0.0.1, so no peer name is
+# ever resolved. Each node then has its own sandbox on 127.0.0.1:6000, which is
+# exactly where ns_tools looks by default.
 #
-# Do not wrap this in a retry. The script's monitoring loop probes nginx with
-# pgrep, which is not executable in this image, so on most nodes it concludes
-# nginx died and exits via a cleanup path that returns 0, roughly three minutes
-# in. That has happened in every run on ~60 of 66 nodes and is harmless: the
-# step survives as long as any task still runs, and no rollout touches the
-# sandbox. Retrying turns those benign zero exits into a non-zero give-up that
-# does kill the job.
-export SANDBOX_COMMAND="${SANDBOX_COMMAND:-SANDBOX_FORCE_SINGLE_NODE=1 /start-with-nginx.sh}"
+# Second, the image ships a pgrep that cannot run:
+#   start-with-nginx.sh: line 697: /usr/bin/pgrep: cannot execute: required file
+#   not found
+# Line 697 is the monitoring loop's liveness probe, `if ! pgrep nginx`. A probe
+# that cannot execute reads as "nginx is gone", so the loop calls cleanup, which
+# logs "Shutting down workers and nginx..." and kills an nginx that was serving
+# fine. In job 7744902 this happened on 64 of 66 nodes about three minutes after
+# each reported ready. It was harmless only while nothing called port 6000.
+# Putting a working pgrep ahead of /usr/bin on PATH keeps the probe honest; it
+# reports liveness from /proc, which is the same question pgrep would ask.
+#
+# ray.sub splices this value inside a single-quoted bash -xc, so it must contain
+# no single quotes.
+#
+# The probe must answer 0 or 1 and nothing else. Processes come and go while
+# /proc is being walked, so a bare grep can exit 2 on a vanished entry even
+# though nginx is up -- which would reintroduce the false negative. Piping the
+# match list into `grep -q .` reports presence only, and discards read errors.
+_nt4_pgrep_shim="mkdir -p /tmp/nrl-shim && { echo \"#!/bin/sh\"; echo \"grep -l nginx /proc/[0-9]*/comm 2>/dev/null | grep -q .\"; } > /tmp/nrl-shim/pgrep && chmod +x /tmp/nrl-shim/pgrep"
+export SANDBOX_COMMAND="${SANDBOX_COMMAND:-${_nt4_pgrep_shim}; PATH=/tmp/nrl-shim:\$PATH SANDBOX_FORCE_SINGLE_NODE=1 /start-with-nginx.sh}"
+unset _nt4_pgrep_shim
 
 # NM4's MTP head exists (mtp_num_layers 2) but speculative decoding has never
 # been exercised on it through the vLLM fork. Off for a first run; it is a

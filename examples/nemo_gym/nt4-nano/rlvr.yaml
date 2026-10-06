@@ -196,33 +196,54 @@ env:
       - "<function_call>"
       - "</function_call>"
 
-    # A deliberate subset of Lightning's ~35 resource servers, and not a
-    # guessed one: every agent_ref surviving the data filter was checked to be
-    # defined by one of these files. The families kept are the judge-driven
-    # ones, which is both what the 22 extra nodes exist to serve and what most
-    # of this dataset is -- on a 20k-row sample the survivors are ~38%
-    # equivalence_llm_judge, ~38% genrm (including its reasoning-off variant),
-    # ~9% instruction_following, ~9% math_with_judge, ~3% lc_equivalence_rule
-    # and ~4% jailbreak, so all three external pools get real traffic.
+    # Lightning's list verbatim, so the training distribution is the Super 3.5
+    # one rather than a judge-only slice of it. Every agent_ref in the RLVR file
+    # was mapped to its defining config and checked against this list: it covers
+    # all but five families (conversational_tool_use, finance, citation_if,
+    # scicode, structured_outputs_v4), and four of those five have almost no
+    # rows that fit an 8192-position context anyway.
     #
-    # Tool-use, terminal and sandbox servers are left out on purpose: they need
-    # the nemo-skills sandbox and tool parsers that have never been exercised
-    # against NM4, and bringing them in would confound a judge-fleet validation
-    # with an unrelated integration. filter_rlvr_by_length.py drops their rows,
-    # so nothing is left referencing a server that is not here.
+    # Widening this costs no new judge infrastructure -- Lightning serves these
+    # same 33 servers from exactly the three external pools we already run
+    # (genrm, nl2bash, safety). It does require a working sandbox, because
+    # ns_tools, code_gen and terminus_judge call it; see SANDBOX_COMMAND in the
+    # launcher for why that needed a pgrep shim.
     config_paths:
       - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
       - resources_servers/math_with_judge/configs/math_with_judge.yaml
-      - resources_servers/genrm_compare/configs/genrm_compare.yaml
-      - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
-      - resources_servers/equivalence_llm_judge/configs/lc_judge.yaml
-      - resources_servers/equivalence_llm_judge/configs/nl2bash-equivalency.yaml
-      # Rule-based, not model-based, and so costs no GPU. Needed because
-      # lc_equivalence_rule_simple_agent is a real slice of the data (~1.3%)
-      # and is defined here rather than under equivalence_llm_judge.
-      - resources_servers/equivalence_rule/configs/lc.yaml
+      - resources_servers/code_gen/configs/code_gen.yaml
+      - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+      - resources_servers/mcqa/configs/mcqa.yaml
       - resources_servers/instruction_following/configs/instruction_following.yaml
+      - resources_servers/equivalence_llm_judge/configs/lc_judge.yaml
+      - resources_servers/calendar/configs/calendar.yaml
+      - resources_servers/genrm_compare/configs/genrm_compare.yaml
+      - resources_servers/equivalence_llm_judge/configs/nl2bash-equivalency.yaml
+      - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+      - resources_servers/terminus_judge/configs/terminus_judge_string_only.yaml
+      - resources_servers/ns_tools/configs/ns_tools.yaml
+      - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
+      # swerl_gen disabled: requires Apptainer/Singularity (not available on aarch64)
+      # - resources_servers/swerl_gen/configs/swerl_gen.yaml
+      - resources_servers/multichallenge/configs/multichallenge.yaml
+      - resources_servers/inverse_if/configs/inverse_if.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/toolcall_schema_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/abstention/configs/abstention.yaml
+      - resources_servers/nvarc/configs/inductive.yaml
+      - resources_servers/nvarc/configs/transductive.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/droid_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/equivalence_rule/configs/lc.yaml
+      - resources_servers/ether0/configs/ether0.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_json_yaml_xml_v1.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_v3.yaml
+      - resources_servers/format_verification/configs/freeform_formatting.yaml
+      - resources_servers/format_verification/configs/citation_format.yaml
       - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
+      - resources_servers/indirect_prompt_injection/configs/indirect_prompt_injection.yaml
 
     policy_model:
       responses_api_models:
