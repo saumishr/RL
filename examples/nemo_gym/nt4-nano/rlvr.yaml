@@ -184,7 +184,26 @@ policy:
       # MTP has to go rather than merely be cheaper: the vLLM container this
       # run generates with does not support MTP, so those weights could not be
       # consumed on the generation side even if training produced them.
+      #
+      # It has to be set in both places. This one is the provider field, which
+      # feeds layer accounting. On its own it does nothing, which is what job
+      # 7762144 showed: the assertion came back unchanged, because
+      # experimental_nm4_llava_provider.__post_init__ runs after
+      # model_overrides is merged, and the model is built from the restored
+      # checkpoint args -- `hybrid_layer_pattern=args.hybrid_layer_pattern` --
+      # not from this field. The saved_args copy below is the one the model
+      # actually gets; they are kept identical so the two cannot drift.
       hybrid_layer_pattern: "M-M-M*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEM-M-"
+
+      saved_args:
+        # The authoritative one. __post_init__ rebuilds `args` from saved_args
+        # and provide() passes args.hybrid_layer_pattern into the model, so
+        # this is what decides whether the MTP blocks exist. Overriding one key
+        # here is safe: _merge_model_override_value descends into mappings, so
+        # the checkpoint's other saved args (vlm_checkpoint_layout among them,
+        # which __post_init__ validates) are preserved. This is the same
+        # channel the parent recipe already uses for attention_backend.
+        hybrid_layer_pattern: "M-M-M*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEM-M-"
 
   generation:
     # The parent's 1024 is a math-pipeclean budget. Judged RLVR responses carry
