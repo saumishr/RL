@@ -106,6 +106,30 @@ policy:
   # so the unchunked logit tensor is the single largest activation in the run.
   logprob_chunk_size: 2048
 
+  megatron_cfg:
+    # Turn off the multi-token-prediction head. The parent is a CLEVR SFT
+    # training block, where mtp_num_layers 2 / mtp_loss_scaling_factor 0.3 are
+    # deliberate; for GRPO the MTP term is inherited baggage. It adds a
+    # next-next-token cross-entropy to the policy-gradient loss, which is not
+    # the objective we are optimizing, and ENABLE_MTP_INFERENCE is 0 so the
+    # head is not used for speculative decoding either. The RL recipes that
+    # share this lineage agree: grpo-nanov3-30ba3b sets both to zero.
+    #
+    # It is also what made job 7758485 run out of memory one microbatch into
+    # step 1/10. MTP's loss goes through fused_vocab_parallel_cross_entropy,
+    # which materializes fp32 logits over the full 262272-vocab and does not
+    # honour the logprob chunking above:
+    #   8192 tokens x 262272 x 4 B = 8.0 GiB
+    # against the 7.75 GiB allocation that actually failed, with 3.07 GiB free
+    # of 184.31 GiB. train_micro_batch_size is already 1, so there was no
+    # batch-size lever left -- this buffer is irreducible while MTP is on.
+    #
+    # The 32-node text pipeclean ran this same config with MTP enabled, which
+    # is not a contradiction: its data file was capped at 4k, so the same
+    # tensor was half the size and fit.
+    mtp_num_layers: 0
+    mtp_loss_scaling_factor: 0.0
+
   generation:
     # The parent's 1024 is a math-pipeclean budget. Judged RLVR responses carry
     # a reasoning block, so they need real room. 4096 out of the 8192 total is
