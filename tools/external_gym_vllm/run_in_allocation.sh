@@ -385,6 +385,14 @@ cleanup_replica() {
 trap cleanup_replica EXIT
 trap 'trap - EXIT; cleanup_replica; exit 143' TERM INT
 
+# serve_vllm_on_ray.py applies NeMo RL's vLLM source patches, but it runs only
+# on the replica head, and a multi-node replica's Ray workers import vLLM from
+# their own node's container filesystem. Patch every node before Ray starts so
+# the replica cannot come up half-patched. The patches are idempotent, so the
+# head applying them again later is harmless.
+echo "[${REPLICA_ID}] Applying NeMo RL vLLM source patches"
+"${VLLM_PYTHON}" -c 'from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat; ensure_vllm_source_compat()'
+
 if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   rm -f "${HEAD_IP_FILE}"
   HEAD_IP=$(hostname -I | awk '{ print $1 }')

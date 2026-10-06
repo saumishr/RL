@@ -1342,6 +1342,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    _patch_vllm_cutedsl_available_requires_quack(patch_logger)
 
 
 def _apply_vllm_patches(
