@@ -312,6 +312,47 @@ env:
           model: null   # set by the launcher
           return_token_id_information: false
           uses_reasoning_parser: false
+          debug: true
+          ray_worker_py_executable: /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
+          # This pool is served externally (the launcher injects base_url), and
+          # app.py skips the local launch entirely when base_url is set. These
+          # two keys are still required: LocalVLLMModelConfig declares
+          # vllm_serve_kwargs and vllm_serve_env_vars with no defaults, so
+          # omitting them makes the judge process die on a pydantic
+          # ValidationError the moment Gym starts it. That is what killed job
+          # 7756306 at 17:31 on 86 nodes, after the config had merged and the
+          # policy and all 63 policy-vLLM engines were up.
+          #
+          # They describe a local serve that will not happen here, so they are
+          # carried over from Lightning verbatim rather than invented: if
+          # external pools are ever disabled, this is the shape that is known to
+          # serve this checkpoint.
+          vllm_serve_env_vars:
+            VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_USE_FLASHINFER_MOE_FP16: "0"
+            VLLM_USE_FLASHINFER_MOE_FP8: "0"
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
+            NCCL_MNNVL_ENABLE: "1"
+          vllm_serve_kwargs:
+            attention_backend: TRITON_ATTN
+            tensor_parallel_size: 4
+            data_parallel_size: 4
+            data_parallel_size_local: 1
+            pipeline_parallel_size: 1
+            enable_expert_parallel: true
+            enable_auto_tool_choice: true
+            tool_call_parser: hermes
+            gpu_memory_utilization: 0.85
+            max_model_len: 131072
+            max_num_seqs: 256
+            enable_prefix_caching: true
+            enable_chunked_prefill: true
+            model_loader_extra_config:
+              enable_multithread_load: true
+              num_threads: 112
+            compilation_config:
+              cudagraph_capture_sizes: [1,2,4,8,16,32,64,128,256]
 
     equivalence_llm_judge:
       resources_servers:
@@ -337,6 +378,12 @@ env:
           model: null   # set by the launcher
           return_token_id_information: false
           uses_reasoning_parser: false
+          debug: true
+          # Required with no default, same as nl2bash_judge_model above.
+          vllm_serve_env_vars:
+            VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
           vllm_serve_kwargs:
             attention_backend: TRITON_ATTN
             tensor_parallel_size: 4
@@ -346,6 +393,11 @@ env:
             gpu_memory_utilization: 0.85
             max_model_len: 96000
             max_num_seqs: 256
+            model_loader_extra_config:
+              enable_multithread_load: true
+              num_threads: 112
+            compilation_config:
+              cudagraph_capture_sizes: [1,2,4,8,16,32,64,128,256]
 
     jailbreak_detection:
       resources_servers:
