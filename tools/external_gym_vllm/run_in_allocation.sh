@@ -584,48 +584,24 @@ for pool in "${pool_names[@]}"; do
   lb_step_labels+=("${display_names[${pool}]} load balancer")
 done
 
-deadline=$((SECONDS + max_startup_timeout))
-while true; do
-  all_ready=1
-  for pool in "${pool_names[@]}"; do
-    if ! ready=$(
-      EXTERNAL_VLLM_STATE_DIR="${state_dirs[${pool}]}" \
-      EXTERNAL_VLLM_TOOLS_DIR="${EXTERNAL_VLLM_TOOLS_DIR_HOST}" \
-      EXTERNAL_VLLM_GROUP_ID="${group_ids[${pool}]}" \
-      bash -c 'source "${EXTERNAL_VLLM_TOOLS_DIR}/vllm_backend_registry.sh"; registry_count_ready'
-    ); then
-      echo "[WARN] Could not read ${display_names[${pool}]} registry; retrying" >&2
-      ready=0
-    fi
-    echo "[INFO] ${display_names[${pool}]} ready: ${ready}/${replicas[${pool}]}"
-    if (( ready != replicas[${pool}] )); then
-      all_ready=0
-    fi
-  done
-  (( all_ready == 1 )) && break
-  check_service_steps
-  if (( SECONDS >= deadline )); then
-    echo "[FATAL] Timed out waiting for all external vLLM pools" >&2
-    exit 1
-  fi
-  sleep 15
-done
-
 for pool in "${pool_names[@]}"; do
-  until curl -sfm 10 "${pool_urls[${pool}]}/models" >/dev/null 2>&1; do
-    check_service_steps
-    if (( SECONDS >= deadline )); then
-      echo "[FATAL] ${display_names[${pool}]} load balancer failed its end-to-end /models probe" >&2
-      exit 1
-    fi
-    sleep 5
-  done
   echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
   COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
 done
 export COMMAND
 
-echo "[INFO] External vLLM pools are healthy; starting NeMo RL"
+echo "[INFO] External vLLM load balancers are up; starting NeMo RL alongside pool warmup"
+# Loading and JIT-compiling a judge fleet takes tens of minutes. Blocking on
+# that before starting Ray leaves every training GPU idle for the whole window,
+# and the cluster's reaper cancels a job whose GPUs sit idle that long -- which
+# is what killed the first 86-node attempt at 30 minutes, 90 seconds after the
+# pools finally reported ready. A pool's URL is its load balancer's, which is
+# listening already and is independent of whether any backend has registered,
+# so the two halves can warm in parallel: NeMo RL spends that time extracting
+# containers and loading the policy, and does not call a judge until its first
+# rollout. The readiness poll below reports progress without gating, and
+# check_service_steps still tears the run down if a pool dies.
+#
 # ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
 # Restrict those variables to component 0; srun also defaults to hetgroup 0.
 # `env` execs bash directly, so ray_sub_pid is the process that owns its traps.
@@ -635,12 +611,49 @@ env \
   bash "${RAY_SUB}" &
 ray_sub_pid=$!
 
+_stop_ray_sub() {
+  touch "${LOG_DIR}/ENDED"
+  kill "${ray_sub_pid}" 2>/dev/null || true
+  wait "${ray_sub_pid}" 2>/dev/null || true
+}
+
+deadline=$((SECONDS + max_startup_timeout))
+pools_ready=0
+next_probe=0
 while kill -0 "${ray_sub_pid}" 2>/dev/null; do
   if ! check_service_steps; then
-    touch "${LOG_DIR}/ENDED"
-    kill "${ray_sub_pid}" 2>/dev/null || true
-    wait "${ray_sub_pid}" 2>/dev/null || true
+    _stop_ray_sub
     exit 1
+  fi
+  if (( pools_ready == 0 && SECONDS >= next_probe )); then
+    next_probe=$((SECONDS + 15))
+    all_ready=1
+    for pool in "${pool_names[@]}"; do
+      if ! ready=$(
+        EXTERNAL_VLLM_STATE_DIR="${state_dirs[${pool}]}" \
+        EXTERNAL_VLLM_TOOLS_DIR="${EXTERNAL_VLLM_TOOLS_DIR_HOST}" \
+        EXTERNAL_VLLM_GROUP_ID="${group_ids[${pool}]}" \
+        bash -c 'source "${EXTERNAL_VLLM_TOOLS_DIR}/vllm_backend_registry.sh"; registry_count_ready'
+      ); then
+        echo "[WARN] Could not read ${display_names[${pool}]} registry; retrying" >&2
+        ready=0
+      fi
+      echo "[INFO] ${display_names[${pool}]} ready: ${ready}/${replicas[${pool}]}"
+      if (( ready != replicas[${pool}] )); then
+        all_ready=0
+      elif ! curl -sfm 10 "${pool_urls[${pool}]}/models" >/dev/null 2>&1; then
+        echo "[WARN] ${display_names[${pool}]} load balancer has not passed its /models probe yet" >&2
+        all_ready=0
+      fi
+    done
+    if (( all_ready == 1 )); then
+      pools_ready=1
+      echo "[INFO] All external vLLM pools are healthy"
+    elif (( SECONDS >= deadline )); then
+      echo "[FATAL] Timed out waiting for all external vLLM pools" >&2
+      _stop_ray_sub
+      exit 1
+    fi
   fi
   sleep 5
 done

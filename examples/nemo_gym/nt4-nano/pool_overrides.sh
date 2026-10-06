@@ -38,3 +38,19 @@ _nt4_kernel_config='{"enable_jit_warmup": false, "enable_cutedsl_warmup": false}
 external_vllm_pool_args GENRM --kernel-config "${_nt4_kernel_config}"
 external_vllm_pool_args NL2BASH --kernel-config "${_nt4_kernel_config}"
 unset _nt4_kernel_config
+
+# Most of a judge's startup is its "initial profiling run", and most of that is
+# FlashInfer building JIT modules. FlashInfer derives its cache from
+# FLASHINFER_WORKSPACE_BASE, which Lightning pins to /tmp, so every replica
+# rebuilds the same modules from scratch on every run. Point each pool at a
+# per-pool directory on shared storage so the builds survive across jobs. The
+# first run still pays for them; later runs reuse them, which is what keeps the
+# judges inside the idle-GPU budget. Per-pool paths keep GenRM and NL2Bash from
+# contending over the same build locks.
+for _nt4_pool in GENRM NL2BASH; do
+  external_vllm_pool_env "${_nt4_pool}" \
+    "FLASHINFER_WORKSPACE_BASE=${PERSISTENT_CACHE}/judges/${_nt4_pool,,}" \
+    "VLLM_CACHE_ROOT=${PERSISTENT_CACHE}/judges/${_nt4_pool,,}/vllm"
+  mkdir -p "${PERSISTENT_CACHE}/judges/${_nt4_pool,,}/vllm"
+done
+unset _nt4_pool
