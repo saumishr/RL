@@ -362,6 +362,56 @@ env:
             name: policy_model
           should_use_judge: false
 
+    # The remaining three servers in config_paths need their judge pointed
+    # somewhere, and each ships a default that is wrong here. Lightning sends
+    # all three to nl2bash_judge_model (the Qwen3-235B pool) and these match it.
+    #
+    # inverse_if is the one that actually fails closed: its default names a
+    # 'judge_model' server that nothing defines, so Gym raises
+    # ServerRefNotFoundError while merging the config and the run dies. That
+    # cost job 7755025 its 86 nodes 15 minutes in, after the policy checkpoint
+    # had loaded and all 63 vLLM engines were up.
+    inverse_if:
+      resources_servers:
+        inverse_if:
+          judge_model_server:
+            type: responses_api_models
+            name: nl2bash_judge_model
+
+    # abstention defaults to genrm_model, which is a pairwise comparison reward
+    # model rather than a judge, and multichallenge defaults to policy_model,
+    # which would have the policy grade its own rollouts and spend policy
+    # generation capacity doing it. Both validate, so neither would have been
+    # caught by a config error -- they would just have been quietly wrong.
+    abstention:
+      resources_servers:
+        abstention:
+          abstention_reward: 0.5
+          judge_model_server:
+            type: responses_api_models
+            name: nl2bash_judge_model
+          judge_responses_create_params:
+            max_output_tokens: 8192
+
+    multichallenge:
+      resources_servers:
+        multichallenge:
+          judge_model_server:
+            type: responses_api_models
+            name: nl2bash_judge_model
+          judge_responses_create_params:
+            max_output_tokens: 8192
+
+    # Carried over from Lightning unchanged. code_gen runs unit tests in the
+    # sandbox rather than calling a judge, so it needs process count and timeout
+    # rather than a model server.
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 2048
+          unit_test_timeout_secs: 10
+          debug: false
+
 logger:
   log_dir: logs/nt4nano-rlvr-86n4g-gym
   wandb:
