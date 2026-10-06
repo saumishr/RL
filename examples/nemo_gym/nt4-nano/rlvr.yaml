@@ -140,10 +140,12 @@ data:
   shuffle: true
   num_workers: 1
   train:
-    # The parent selects OpenMathInstruct-2 through the built-in math env.
-    # Clear both so NemoGymDataset is the unambiguous source.
-    dataset_name: null
-    split_validation_size: null
+    # Only data_path, as in the Lightning recipe. data.default already names
+    # NemoGymDataset, and naming dataset_name or split_validation_size here --
+    # even as null -- is not a way to clear the parent's choice: data.train is
+    # validated against a union of dataset configs that requires a str and a
+    # float respectively, so a null fails every branch and the driver dies in
+    # config validation before it reaches the cluster.
     data_path: null   # set by the launch script
   validation:
     data_path: null   # set by the launch script
