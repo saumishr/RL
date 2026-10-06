@@ -54,6 +54,13 @@ export WANDB_PROJ="${WANDB_PROJ:-nemo-rl-nt4nano}"
 # without re-checking the sampling importance ratio on step 1.
 export MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/nemotron/users/tbarnatan/models/nm4/nemotron4-nano-wsm-vlm}"
 
+# policy.tokenizer.name comes from the inherited VLM recipe as
+# ${oc.env:NT4_NANO_PROCESSOR,<this path>}. Name it here so it is mounted
+# below rather than inherited as a path the container cannot see: get_tokenizer
+# runs before any cluster work, and when the directory is missing transformers
+# falls back to treating it as a Hub repo id and dies on the leading slash.
+export NT4_NANO_PROCESSOR="${NT4_NANO_PROCESSOR:-/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sauramishra/pipeclean-v2/models/nt4-nano-processor}"
+
 # -----------------------------------------------------------------------------
 # Node allocation
 # -----------------------------------------------------------------------------
@@ -159,6 +166,9 @@ _nt4_mounts=(
   # container. The NM4 pipeclean launcher self-mounts for the same reason.
   "${PROJECT_ROOT}:${PROJECT_ROOT}"
   "$(dirname "${MODEL_PATH}"):$(dirname "${MODEL_PATH}"):ro"
+  # The processor is its own export, so mount the directory itself rather than
+  # its parent -- the parent also holds the dist checkpoint and the 128B model.
+  "${NT4_NANO_PROCESSOR}:${NT4_NANO_PROCESSOR}:ro"
   "$(dirname "${GENRM_MODEL}"):$(dirname "${GENRM_MODEL}"):ro"
   "$(dirname "${NL2BASH_JUDGE_MODEL}"):$(dirname "${NL2BASH_JUDGE_MODEL}"):ro"
   "$(dirname "${TRAIN_PATH}"):$(dirname "${TRAIN_PATH}")"
