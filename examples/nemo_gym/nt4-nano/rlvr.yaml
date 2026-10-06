@@ -129,19 +129,30 @@ policy:
     # tensor was half the size and fit.
     mtp_num_layers: 0
     mtp_loss_scaling_factor: 0.0
-    # Not optional alongside the above. The Nemotron4 provider defaults
-    # mtp_hsm to True, and MCore's transformer_config.__post_init__ raises
-    # "mtp_hsm=True requires mtp_num_layers >= 2", so zeroing the layers alone
-    # is an invalid combination and the model never builds -- job 7759598 died
-    # in finalize() at 16 minutes. mtp_hsm only shapes the MTP heads, so with
-    # MTP off it is inert.
+
+    # mtp_hsm has to travel by a different road than the two keys above. MCore
+    # raises "mtp_hsm=True requires mtp_num_layers >= 2", and
+    # nemotron4_bridge.py sets mtp_hsm from the checkpoint's own architecture
+    # (mtp_hsm=mtp_depths >= 2, and NM4 Nano's layer pattern ends in two MTP
+    # depths), so it arrives True no matter what this recipe says. But
+    # NeMo-RL's MegatronConfig TypedDict declares mtp_num_layers,
+    # mtp_loss_scaling_factor and mtp_use_repeated_layer -- and not mtp_hsm --
+    # so writing it alongside them is silently dropped. That is what happened
+    # to job 7760082: it took mtp_num_layers=0, ignored mtp_hsm=false, and died
+    # on the very error the key was added to prevent.
     #
-    # For the record, the other two MTP-dependent checks in MCore are already
-    # satisfied and need nothing here: the hyper-connections conflict is gated
-    # on enable_mhc_connections, which NM4 never sets, and the
-    # overlap_moe_expert_parallel_comm assert accepts mtp_num_layers in
-    # (None, 0, 1).
-    mtp_hsm: false
+    # model_overrides is the sanctioned channel for Megatron Bridge model
+    # fields without a dedicated key (nemo_rl/models/megatron/setup.py). It is
+    # merged into the provider before _apply_mtp_config and before finalize(),
+    # so both halves of this fix land before validation. mtp_hsm only shapes
+    # the MTP heads, so with MTP off it is inert.
+    #
+    # The other two MTP-dependent checks in MCore need nothing: the
+    # hyper-connections conflict is gated on enable_mhc_connections, which NM4
+    # never sets, and the overlap_moe_expert_parallel_comm assert accepts
+    # mtp_num_layers in (None, 0, 1).
+    model_overrides:
+      mtp_hsm: false
 
   generation:
     # The parent's 1024 is a math-pipeclean budget. Judged RLVR responses carry
