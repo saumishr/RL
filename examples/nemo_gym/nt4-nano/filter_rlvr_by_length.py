@@ -90,6 +90,16 @@ def main() -> None:
         help="Repeatable. Defaults to the judge-driven families the NT4 recipe wires.",
     )
     parser.add_argument(
+        "--drop-agent-prefix",
+        action="append",
+        default=None,
+        help=(
+            "Repeatable, applied after --keep-agent-prefix. Use this when the "
+            "recipe wires nearly every server and it is the exceptions that are "
+            "worth naming, which is clearer than restating thirty keep prefixes."
+        ),
+    )
+    parser.add_argument(
         "--max-rows",
         type=int,
         default=None,
@@ -98,6 +108,7 @@ def main() -> None:
     args = parser.parse_args()
 
     keep = tuple(args.keep_agent_prefix or DEFAULT_KEEP_PREFIXES)
+    drop = tuple(args.drop_agent_prefix or ())
 
     from transformers import AutoTokenizer
 
@@ -127,7 +138,7 @@ def main() -> None:
                 continue
 
             name = agent_name(row)
-            if not name.startswith(keep):
+            if not name.startswith(keep) or (drop and name.startswith(drop)):
                 dropped["unwired_agent"] += 1
                 dropped_by_agent[name] += 1
                 continue
@@ -157,8 +168,8 @@ def main() -> None:
     print("kept by agent:")
     for name, count in kept_by_agent.most_common():
         print(f"  {count:8d}  {name}")
-    print("dropped by agent (top 15):")
-    for name, count in dropped_by_agent.most_common(15):
+    print("dropped by agent:")
+    for name, count in dropped_by_agent.most_common():
         print(f"  {count:8d}  {name}")
 
 
