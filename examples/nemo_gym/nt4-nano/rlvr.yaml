@@ -66,6 +66,13 @@ grpo:
   val_period: 0
   val_at_start: false
   val_at_end: false
+  # Gym takes the validation set exactly as given and sizes both of these from
+  # it, so it rejects a non-null max_val_samples outright rather than silently
+  # subsampling. The check runs before val_period is consulted, so the 256
+  # inherited from grpo_math_1B.yaml kills the driver even though we never
+  # validate. Lightning sets both the same way.
+  max_val_samples: null
+  val_batch_size: 256
   seed: 42
   # Rows whose tool calls come back malformed are penalised rather than
   # dropped, as in Lightning.
