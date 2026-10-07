@@ -105,15 +105,17 @@ policy:
   # for chunking the logprob pass. Worth having here: the vocabulary is 262272,
   # so the unchunked logit tensor is the single largest activation in the run.
   #
-  # 512, not the 2048 that read as a safe default. The chunk size also sizes the
-  # backward of the vocab-parallel logprob, and the dominant allocation there is
-  # not the logits -- it is the one-hot in model_utils.py:320, which
-  # torch.nn.functional.one_hot materializes in int64. One chunk therefore costs
-  # chunk * 262272 * 8 bytes, so 2048 asks for exactly 4.00 GiB and 7762681 died
-  # requesting exactly that with 2.64 GiB free. 512 brings it to 1.00 GiB, plus
-  # 0.50 GiB for the fp32 copy on the next line. The forward was never the
-  # problem; it reached a full optimizer step with grad_norm before this fired.
-  logprob_chunk_size: 512
+  # 256, not the 2048 that read as a safe default. The chunk size also sizes the
+  # backward of the vocab-parallel logprob, where every per-chunk temporary is
+  # chunk * 262272 * 4 bytes, so the knob scales that whole working set.
+  #
+  # The budget is what forces a small value. Step 1 fits comfortably, then Adam
+  # materializes its state and from step 2 onward the process holds 182.63 GiB
+  # of a 184.31 GiB GPU, leaving under 1.7 GiB for the backward to work in:
+  # 7765260 completed step 1/10 and died in step 2 on a 1.00 GiB request. 256
+  # keeps the peak well inside that, at the cost of 32 chunks per 8192-token
+  # sequence instead of 16.
+  logprob_chunk_size: 256
 
   megatron_cfg:
     # Turn off the multi-token-prediction head. The parent is a CLEVR SFT
