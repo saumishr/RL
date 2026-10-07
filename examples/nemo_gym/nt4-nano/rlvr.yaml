@@ -284,6 +284,15 @@ env:
   nemo_gym:
     nemo_gym_log_dir: "logs/nemo_gym"
     skip_venv_if_present: true
+    # Gym's default bound is 600s, measured from the moment its own 74 servers
+    # are up, and at this scale that window closes while the 64 policy vLLM
+    # endpoints are still capturing CUDA graphs and JIT-compiling FlashInfer
+    # kernels. When it expires Gym calls shutdown() and the run produces no
+    # rollouts at all: 7763933 sat at 86 nodes for 38 minutes that way, and
+    # 7762681 only survived because its endpoints answered just inside 600s.
+    # The margin, not the mechanism, was the difference, so pick a bound that
+    # cannot be reached by a healthy startup while still failing a dead one.
+    model_endpoint_readiness_timeout_seconds: 3600
     # GenRM and NL2Bash are external pools; these nodes host only the
     # Gym-managed safety judge.
     num_gpu_nodes: 2
