@@ -117,6 +117,23 @@ def test_unknown_process_group_raises(restore_wrapper):
 
 
 @pytest.mark.mcore
+def test_progress_dict_preserves_mapping_semantics():
+    """mcore indexes and sizes this mapping as well as iterating it."""
+    from nemo_rl.models.megatron.setup import _ProgressReportingDict
+
+    source = {(index, 0, 0): index % 8 for index in range(250)}
+    wrapped = _ProgressReportingDict(source, "rank 0:", 100)
+
+    assert len(wrapped) == 250
+    assert wrapped[(5, 0, 0)] == 5
+    assert (7, 0, 0) in wrapped
+    assert dict(wrapped) == source
+    # The exchange relies on a deterministic order, so iteration must not
+    # reorder or drop shards.
+    assert [shard for shard, _ in wrapped.items()] == list(source)
+
+
+@pytest.mark.mcore
 def test_patch_is_idempotent(restore_wrapper, monkeypatch):
     setup_mod = restore_wrapper
     monkeypatch.setattr(

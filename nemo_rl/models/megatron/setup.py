@@ -2193,6 +2193,10 @@ def _patch_fully_parallel_load(checkpoint_cfg: Any) -> None:
     if _fully_parallel_load_patched:
         return
 
+    # Independent of the overrides below: a 'dp' load still needs to report the
+    # group it ran over and how far the exchange got.
+    _instrument_exchange_progress()
+
     per_rank_objects = (
         os.environ.get("NRL_MEGATRON_PER_RANK_OBJECT_LOAD", "1") == "1"
     )
@@ -2244,6 +2248,189 @@ def _patch_fully_parallel_load(checkpoint_cfg: Any) -> None:
 
     FullyParallelLoadStrategyWrapper.__init__ = init_with_configured_load
     _fully_parallel_load_patched = True
+
+
+def _dump_loaded_parameter_checksums(model: Any) -> None:
+    """Checksum every local parameter so two load paths can be compared.
+
+    Changing the load's parallelization group changes *which* rank reads each
+    shard and broadcasts it. If a group fails to cover some tensor's
+    replication pattern the result is wrong weights, not a crash, so a load
+    change cannot be validated on wall-clock alone. Rank ownership is fixed by
+    the parallel layout and not by the exchange, so for a given layout each
+    rank's parameters must be bit-identical across load paths: running the
+    probe once with ``ep_dp`` and once with ``dp`` and diffing these files
+    settles correctness.
+
+    Set ``NRL_CKPT_CHECKSUM_DIR`` to a shared directory. Off by default --
+    this reads every local parameter back to host memory.
+    """
+    out_dir = os.environ.get("NRL_CKPT_CHECKSUM_DIR")
+    if not out_dir:
+        return
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    os.makedirs(out_dir, exist_ok=True)
+    chunks = model if isinstance(model, list) else [model]
+
+    lines = []
+    for chunk_index, chunk in enumerate(chunks):
+        for name, param in chunk.named_parameters():
+            # bfloat16 has no numpy dtype; float32 widening is exact and keeps
+            # the digest independent of the storage dtype.
+            data = param.detach().to(torch.float32).cpu().contiguous()
+            digest = hashlib.blake2b(data.numpy().tobytes(), digest_size=16)
+            lines.append(
+                f"{chunk_index}\t{name}\t{tuple(param.shape)}\t{digest.hexdigest()}"
+            )
+
+    path = os.path.join(out_dir, f"rank_{rank:05d}.tsv")
+    with open(path, "w") as handle:
+        handle.write("\n".join(lines) + "\n")
+    print(
+        f"[ckpt-probe] rank {rank}: wrote {len(lines)} parameter checksums to {path}",
+        flush=True,
+    )
+
+
+def _exit_after_checkpoint_load_if_requested(model: Any = None) -> None:
+    """Stop the job once the checkpoint is loaded, for load-only probes.
+
+    Validating checkpoint-load changes otherwise costs a full allocation: the
+    training tier is a third of the 1536-node Ultra run, and a step cannot run
+    without the generation tier behind it. The expensive part of the load --
+    the expert exchange -- depends on DP and EP, not on CP or node count, so a
+    small train-only job can reproduce it exactly and then exit here.
+
+    Set ``NRL_EXIT_AFTER_CHECKPOINT_LOAD=1``. Ranks synchronize first so the
+    reported time covers the slowest rank rather than the luckiest.
+    """
+    if os.environ.get("NRL_EXIT_AFTER_CHECKPOINT_LOAD") != "1":
+        return
+    if model is not None:
+        _dump_loaded_parameter_checksums(model)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() == 0:
+            print(
+                "[ckpt-probe] NRL_EXIT_AFTER_CHECKPOINT_LOAD=1: all ranks "
+                "loaded the checkpoint; exiting before training.",
+                flush=True,
+            )
+    raise SystemExit(0)
+
+
+_exchange_progress_patched = False
+
+
+class _ProgressReportingDict(dict):
+    """A dict whose ``items()`` reports how far a consumer has iterated.
+
+    ``exchange_loaded_tensors_broadcast`` walks ``main_rank_for_shard.items()``
+    one shard at a time, so instrumenting ``items()`` yields exact in-loop
+    progress without restating mcore's loop. Every other mapping operation is
+    inherited unchanged.
+    """
+
+    def __init__(self, source: Mapping[Any, Any], label: str, log_every: int):
+        super().__init__(source)
+        self._label = label
+        self._log_every = log_every
+
+    def items(self):  # type: ignore[override]
+        total = len(self)
+        start = time.monotonic()
+        for index, pair in enumerate(super().items()):
+            if index and index % self._log_every == 0:
+                elapsed = time.monotonic() - start
+                rate = index / elapsed if elapsed else 0.0
+                remaining = (total - index) / rate if rate else float("inf")
+                print(
+                    f"[ckpt-exchange] {self._label} {index}/{total} shards "
+                    f"({100.0 * index / total:.1f}%) in {elapsed:.0f}s, "
+                    f"{rate:.1f} shards/s, ETA {remaining / 60:.1f} min",
+                    flush=True,
+                )
+            yield pair
+        elapsed = time.monotonic() - start
+        print(
+            f"[ckpt-exchange] {self._label} finished {total} shards in "
+            f"{elapsed:.0f}s",
+            flush=True,
+        )
+
+
+def _instrument_exchange_progress() -> None:
+    """Make the fully-parallel tensor exchange report its size and progress.
+
+    Two numbers decide whether this load is healthy, and neither was observable
+    during the 1536-node bring-up: the size of the parallelization group the
+    exchange actually runs over, and how many shards each rank must broadcast.
+    Job 1153721 was read as a deadlock purely because rank *counts* at the
+    barrier looked frozen -- which they do whether the exchange is hung or
+    merely slow -- while only a single loop index per rank was ever sampled.
+
+    Logging the group size also closes the gap that let
+    ``ckpt_fully_parallel_load_process_group`` sit inert: a run now states the
+    group it used instead of the group it requested.
+
+    ``NRL_CKPT_EXCHANGE_LOG_EVERY`` sets the shard interval (0 disables);
+    ``NRL_CKPT_EXCHANGE_LOG_ALL_RANKS=1`` reports from every rank rather than
+    global rank 0.
+    """
+    global _exchange_progress_patched
+    if _exchange_progress_patched:
+        return
+
+    log_every = int(os.environ.get("NRL_CKPT_EXCHANGE_LOG_EVERY", "500"))
+    if log_every <= 0:
+        return
+
+    from megatron.core.dist_checkpointing import exchange_utils
+
+    original_exchange = exchange_utils.exchange_loaded_tensors_broadcast
+
+    @functools.wraps(original_exchange)
+    def exchange_with_progress(
+        loaded_tensors: Any,
+        unloaded_shards: Any,
+        shard_distribution: Any,
+        parallelization_group: Any = None,
+    ) -> Any:
+        all_ranks = os.environ.get("NRL_CKPT_EXCHANGE_LOG_ALL_RANKS") == "1"
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else 0
+        )
+        if all_ranks or rank == 0:
+            group_size = (
+                torch.distributed.get_world_size(parallelization_group)
+                if parallelization_group is not None
+                else torch.distributed.get_world_size()
+            )
+            shards = len(shard_distribution.main_rank_for_shard)
+            print(
+                f"[ckpt-exchange] rank {rank}: broadcasting {shards} shards "
+                f"over a {group_size}-rank parallelization group",
+                flush=True,
+            )
+            shard_distribution = shard_distribution._replace(
+                main_rank_for_shard=_ProgressReportingDict(
+                    shard_distribution.main_rank_for_shard,
+                    f"rank {rank}:",
+                    log_every,
+                )
+            )
+        return original_exchange(
+            loaded_tensors,
+            unloaded_shards,
+            shard_distribution,
+            parallelization_group,
+        )
+
+    exchange_utils.exchange_loaded_tensors_broadcast = exchange_with_progress
+    _exchange_progress_patched = True
 
 
 def _expert_data_parallel_replica_group() -> Any:
@@ -2916,6 +3103,7 @@ def setup_model_and_optimizer(
         _patch_fully_parallel_load(megatron_cfg.checkpoint)
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
+        load_started_at = time.monotonic()
         with _sync_consumed_samples_on_scheduler_load(state, scheduler):
             load_checkpoint(
                 state,
@@ -2926,7 +3114,8 @@ def setup_model_and_optimizer(
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and megatron_cfg.dist.use_torch_fsdp2,
             )
-        print("Checkpoint loaded")
+        print(f"Checkpoint loaded in {time.monotonic() - load_started_at:.0f}s")
+        _exit_after_checkpoint_load_if_requested(model)
 
         # See _force_sync_optimizer_fp32_from_model: required when
         # optimizer_cpu_offload=True so the first optimizer step does Adam on the
