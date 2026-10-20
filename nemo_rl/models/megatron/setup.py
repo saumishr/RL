@@ -14,7 +14,9 @@
 
 import copy
 import datetime
+import functools
 import hashlib
+import inspect
 import json
 import os
 import threading
@@ -2148,6 +2150,121 @@ def _create_checkpoint_config(
     return CheckpointConfig(**kwargs)
 
 
+_fully_parallel_load_patched = False
+
+
+def _patch_fully_parallel_load(checkpoint_cfg: Any) -> None:
+    """Restore the fully-parallel load arguments Megatron Bridge drops.
+
+    Bridge builds the load strategy with two positional arguments --
+    ``FullyParallelLoadStrategyWrapper(load_strategy, pg_collection.dp_cp)``
+    (``checkpointing.py:2360`` and ``:3647``) -- where Megatron-LM's native loop
+    passes six (``megatron/training/checkpointing.py:2016-2041``). Three
+    ``CheckpointConfig`` fields are therefore inert under Bridge even when
+    spelled correctly, and this patch supplies them. Two matter:
+
+    ``per_rank_object_load`` keeps its ``False`` default, so the object exchange
+    falls through to ``exchange_loaded_objects_gather_object``, which calls
+    ``all_gather_object(..., group=None)`` -- every rank in the default group,
+    independent of the configured process group, which reaches only the *tensor*
+    exchange. At 2048 ranks it does not complete: jobs 1152067, 1152602 and
+    1153105 all hung there, confirmed by py-spy. mcore documents
+    ``per_rank_object_load=True`` as the supported alternative -- objects are
+    addressed by a ``unique_key`` that excludes ``replica_id``, so each is
+    written once and any rank can read it locally, trading the collective for
+    cheap local reads of RNG states and ``_extra_state``.
+
+    ``parallelization_group`` is pinned to ``dp_cp``, which is wrong for MoE.
+    Expert weights are sharded over EP, not replicated over ``dp_cp``, so in a
+    256-rank ``dp_cp`` group only the 16 ranks sharing an EP rank need any given
+    expert -- yet the exchange broadcasts it to all 256. In job 1153721 that
+    left two groups grinding through 12,544 expert chunks (263 GB) each at
+    roughly 21 MB per blocking broadcast, which does not finish inside a 4.5 h
+    reservation. ``ep_dp`` selects the expert-*replica* group instead, sized to
+    the actual replication pattern.
+
+    ``exchange_algo`` already defaults to ``"broadcast"``, so configuring that
+    value changes nothing; it is forwarded anyway so ``gather_rounds`` becomes
+    reachable.
+
+    Set ``NRL_MEGATRON_PER_RANK_OBJECT_LOAD=0`` to restore the object gather.
+    """
+    global _fully_parallel_load_patched
+    if _fully_parallel_load_patched:
+        return
+
+    per_rank_objects = (
+        os.environ.get("NRL_MEGATRON_PER_RANK_OBJECT_LOAD", "1") == "1"
+    )
+    group_name = getattr(
+        checkpoint_cfg, "ckpt_fully_parallel_load_process_group", "dp"
+    )
+    if group_name not in ("dp", "ep_dp"):
+        raise ValueError(
+            f"Invalid ckpt_fully_parallel_load_process_group: {group_name!r}; "
+            "expected 'dp' (which resolves to dp_cp) or 'ep_dp'."
+        )
+    exchange_algo = getattr(
+        checkpoint_cfg, "ckpt_fully_parallel_load_exchange_algo", None
+    )
+    # 'dp' is what Bridge already hardcodes, so only ep_dp needs an override.
+    override_group = group_name == "ep_dp"
+    if not (per_rank_objects or override_group or exchange_algo):
+        return
+
+    from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+        FullyParallelLoadStrategyWrapper,
+    )
+
+    original_init = FullyParallelLoadStrategyWrapper.__init__
+    parameters = inspect.signature(original_init).parameters
+    if "per_rank_object_load" not in parameters:
+        raise AttributeError(
+            "FullyParallelLoadStrategyWrapper has no per_rank_object_load "
+            "parameter; the WORLD-wide all_gather_object in the object "
+            "exchange would silently remain."
+        )
+    # Positions among the call's positional arguments, self excluded.
+    object_load_index = list(parameters).index("per_rank_object_load") - 1
+    group_index = list(parameters).index("parallelization_group") - 1
+
+    @functools.wraps(original_init)
+    def init_with_configured_load(self: Any, *args: Any, **kwargs: Any) -> None:
+        if per_rank_objects and len(args) <= object_load_index:
+            kwargs.setdefault("per_rank_object_load", True)
+        if exchange_algo:
+            kwargs.setdefault("exchange_algo", exchange_algo)
+        if override_group:
+            group = _expert_data_parallel_replica_group()
+            if len(args) > group_index:
+                args = args[:group_index] + (group,) + args[group_index + 1 :]
+            else:
+                kwargs["parallelization_group"] = group
+        original_init(self, *args, **kwargs)
+
+    FullyParallelLoadStrategyWrapper.__init__ = init_with_configured_load
+    _fully_parallel_load_patched = True
+
+
+def _expert_data_parallel_replica_group() -> Any:
+    """The expert-data-parallel group that holds checkpoint *replicas*.
+
+    ``get_expert_data_parallel_group`` serves two groups. The default
+    (``with_gtp_remat=True``) is the full group for data distribution, whose
+    EGTP-remat peers hold distinct micro-batches rather than replicas;
+    ``with_gtp_remat=False`` is the replicate group mcore documents for
+    "expert grad all-reduce, optimizer state, checkpoint replicas". Only the
+    latter describes the load's replication pattern. The two coincide unless
+    EGTP remat is enabled, and older mcore lacks the argument entirely.
+    """
+    from megatron.core import parallel_state
+
+    accessor = parallel_state.get_expert_data_parallel_group
+    if "with_gtp_remat" in inspect.signature(accessor).parameters:
+        return accessor(with_gtp_remat=False)
+    return accessor()
+
+
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
     """Validate training configuration."""
     assert "train_iters" in config["megatron_cfg"], (
@@ -2796,6 +2913,7 @@ def setup_model_and_optimizer(
 
     # Load checkpoint if applicable
     if should_load_checkpoint:
+        _patch_fully_parallel_load(megatron_cfg.checkpoint)
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
         with _sync_consumed_samples_on_scheduler_load(state, scheduler):
@@ -3056,6 +3174,10 @@ def setup_reference_model_state(
         print("Loading the Reference Model")
 
         if should_load_checkpoint:
+            # ref_checkpoint_config is built locally and carries none of the
+            # ckpt_fully_parallel_* settings, so read them off the policy's
+            # config: this load reads the same checkpoint over the same groups.
+            _patch_fully_parallel_load(megatron_cfg.checkpoint)
             if pre_load_checkpoint_hook is not None:
                 pre_load_checkpoint_hook(ref_state, reference_model)
             load_checkpoint(
