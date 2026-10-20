@@ -19,6 +19,7 @@ import hashlib
 import inspect
 import json
 import os
+import sys
 import threading
 import time
 import warnings
@@ -2196,6 +2197,9 @@ def _patch_fully_parallel_load(checkpoint_cfg: Any) -> None:
     # Independent of the overrides below: a 'dp' load still needs to report the
     # group it ran over and how far the exchange got.
     _instrument_exchange_progress()
+    # The progress counters above only see the exchange. mcore times the reads
+    # too, and which of the two dominates is what decides whether 'ep_dp' helps.
+    _enable_checkpoint_phase_timing()
 
     per_rank_objects = (
         os.environ.get("NRL_MEGATRON_PER_RANK_OBJECT_LOAD", "1") == "1"
@@ -2321,6 +2325,7 @@ def _exit_after_checkpoint_load_if_requested(model: Any = None) -> None:
 
 
 _exchange_progress_patched = False
+_phase_timing_enabled = False
 
 
 class _ProgressReportingDict(dict):
@@ -2358,6 +2363,53 @@ class _ProgressReportingDict(dict):
             f"{elapsed:.0f}s",
             flush=True,
         )
+
+
+def _enable_checkpoint_phase_timing() -> None:
+    """Surface mcore's own read-vs-exchange split for the fully-parallel load.
+
+    ``FullyParallelLoadStrategyWrapper.load`` already brackets both phases --
+    ``base_load_ShardedTensors`` for the storage reads and
+    ``self.exchange_loaded_tensors`` for the broadcast -- but emits them at
+    DEBUG, so neither reaches a default run's log. They are the two numbers that
+    decide whether a slow load is read-bound or broadcast-bound, and that
+    distinction is the whole argument for the load process group: in job 1153721
+    all eight sampled ranks sat in the broadcast and none in any read path, so
+    the reads had already returned and only the exchange was outstanding.
+
+    This matters because ``ep_dp`` trades the two against each other. It shrinks
+    the per-group exchange but raises total read volume, since a shard replicated
+    across fewer ranks is read by more groups instead of broadcast within one. At
+    128 GPUs that trade measured net negative (exchange 16s -> 1s, total load
+    32s -> 39s); the exchange term is the one that grows with rank count, so the
+    sign is expected to flip well before 2048. Without these two timings a run
+    cannot tell which side it landed on.
+
+    Scoped to the single module rather than the ``dist_checkpointing`` package:
+    it carries seven ``debug_time`` blocks and six other debug calls, so this is
+    a handful of lines per load, not per shard. ``propagate`` is cleared because
+    the handler added here would otherwise double-print through the root logger.
+
+    Set ``NRL_CKPT_PHASE_TIMING=0`` to leave mcore's logging untouched.
+    """
+    global _phase_timing_enabled
+    if _phase_timing_enabled:
+        return
+    if os.environ.get("NRL_CKPT_PHASE_TIMING", "1") != "1":
+        return
+
+    import logging
+
+    timing_logger = logging.getLogger(
+        "megatron.core.dist_checkpointing.strategies.fully_parallel"
+    )
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("[ckpt-phase] %(message)s"))
+    timing_logger.addHandler(handler)
+    timing_logger.setLevel(logging.DEBUG)
+    timing_logger.propagate = False
+    _phase_timing_enabled = True
 
 
 def _instrument_exchange_progress() -> None:
