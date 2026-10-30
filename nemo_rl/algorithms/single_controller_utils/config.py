@@ -523,6 +523,12 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Max groups the streaming trainer dispatches in one chunk. ``None`` leaves
+    # chunks unbounded, so a buffer that is already warm trains the whole step as
+    # a single chunk -- which is correct but pins the generation fleet idle for
+    # the entire training tail. A cap splits the step into chunks that overlap
+    # with generation instead.
+    max_groups_for_streaming_train: Optional[int] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -567,6 +573,32 @@ class AsyncRLConfig(BaseModel, extra="allow"):
             raise ValueError(
                 "async_rl blocks have been renamed to say what they watch or route:\n"
                 + "\n".join(stale)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_streaming_chunk_bounds(self) -> "AsyncRLConfig":
+        """The chunk cap must leave room for the floor it is capping.
+
+        ``_train_pump`` clamps the floor down to the cap so a short tail chunk can
+        still close the step. Set the cap below the floor and that clamp fires on
+        *every* chunk, so the configured floor never applies and the run streams at
+        the cap instead -- the floor becomes dead config rather than a bound.
+        """
+        max_groups = self.max_groups_for_streaming_train
+        if max_groups is None:
+            return self
+        if max_groups < 1:
+            raise ValueError(
+                f"async_rl.max_groups_for_streaming_train ({max_groups}) must be >= 1"
+            )
+        if max_groups < self.min_groups_for_streaming_train:
+            raise ValueError(
+                "async_rl.max_groups_for_streaming_train "
+                f"({max_groups}) must be >= "
+                "async_rl.min_groups_for_streaming_train "
+                f"({self.min_groups_for_streaming_train}): the cap would clamp the "
+                "floor on every chunk, leaving the floor with no effect."
             )
         return self
 
@@ -1358,6 +1390,16 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 f"({async_config.min_groups_for_streaming_train}) == "
                 f"num_prompts_per_step ({algo_cfg.num_prompts_per_step})."
             )
+        chunk_cap = async_config.max_groups_for_streaming_train
+        if chunk_cap is not None and chunk_cap < algo_cfg.num_prompts_per_step:
+            raise ValueError(
+                "colocated megatron generation requires each step to be assembled as "
+                "one full batch, so async_rl.max_groups_for_streaming_train "
+                f"({chunk_cap}) must not cap below num_prompts_per_step "
+                f"({algo_cfg.num_prompts_per_step}). The engine stands down for the "
+                "whole train step, so there is no generation to overlap a capped "
+                "chunk with."
+            )
 
     # Capacity is sized from the peak window whatever the algorithm, so an inert
     # setting still costs buffer and fails setup naming the wrong cause.
@@ -1557,6 +1599,8 @@ def resolve_ppo_chunk_alignment(
         (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
     )
     return group_multiple, min_remaining_groups
+
+
 def validate_gym_actor_concurrency(master_config: MasterConfig) -> None:
     """Validate the NeMo-Gym actors can admit the configured rollout fan-in.
 
